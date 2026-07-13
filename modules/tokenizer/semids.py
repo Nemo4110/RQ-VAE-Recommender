@@ -34,26 +34,56 @@ class SemanticIdTokenizer(nn.Module):
         n_cat_feats: int = 18,
         commitment_weight: float = 0.25,
         rqvae_weights_path: Optional[str] = None,
+        rqvae_hf_model_path: Optional[str] = None,
         rqvae_codebook_normalize: bool = False,
         rqvae_sim_vq: bool = False,
     ) -> None:
         super().__init__()
 
-        self.rq_vae = RqVae(
-            input_dim=input_dim,
-            embed_dim=output_dim,
-            hidden_dims=hidden_dims,
-            codebook_size=codebook_size,
-            codebook_kmeans_init=False,
-            codebook_normalize=rqvae_codebook_normalize,
-            codebook_sim_vq=rqvae_sim_vq,
-            n_layers=n_layers,
-            n_cat_features=n_cat_feats,
-            commitment_weight=commitment_weight,
-        )
+        if rqvae_weights_path is not None and rqvae_hf_model_path is not None:
+            raise ValueError("at most one RQ-VAE source may be supplied")
 
-        if rqvae_weights_path is not None:
-            self.rq_vae.load_pretrained(rqvae_weights_path)
+        if rqvae_hf_model_path is not None:
+            self.rq_vae = RqVae.from_pretrained(
+                rqvae_hf_model_path,
+                local_files_only=True,
+            )
+            expected = {
+                "input_dim": input_dim,
+                "embed_dim": output_dim,
+                "hidden_dims": hidden_dims,
+                "codebook_size": codebook_size,
+                "n_layers": n_layers,
+                "n_cat_feats": n_cat_feats,
+            }
+            actual = {
+                "input_dim": self.rq_vae.input_dim,
+                "embed_dim": self.rq_vae.embed_dim,
+                "hidden_dims": self.rq_vae.hidden_dims,
+                "codebook_size": self.rq_vae.codebook_size,
+                "n_layers": self.rq_vae.n_layers,
+                "n_cat_feats": self.rq_vae.n_cat_feats,
+            }
+            if actual != expected:
+                raise ValueError(
+                    f"local Hub RQ-VAE architecture mismatch: {actual} != {expected}"
+                )
+        else:
+            self.rq_vae = RqVae(
+                input_dim=input_dim,
+                embed_dim=output_dim,
+                hidden_dims=hidden_dims,
+                codebook_size=codebook_size,
+                codebook_kmeans_init=False,
+                codebook_normalize=rqvae_codebook_normalize,
+                codebook_sim_vq=rqvae_sim_vq,
+                n_layers=n_layers,
+                n_cat_features=n_cat_feats,
+                commitment_weight=commitment_weight,
+            )
+
+            if rqvae_weights_path is not None:
+                self.rq_vae.load_pretrained(rqvae_weights_path)
 
         self.rq_vae.eval()
 

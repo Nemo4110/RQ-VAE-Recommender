@@ -32,6 +32,7 @@ def train(
     save_dir_root="out/",
     dataset=RecDataset.ML_1M,
     pretrained_rqvae_path=None,
+    pretrained_rqvae_hf_path=None,
     pretrained_decoder_path=None,
     split_batches=True,
     amp=False,
@@ -118,6 +119,7 @@ def train(
         n_layers=vae_n_layers,
         n_cat_feats=vae_n_cat_feats,
         rqvae_weights_path=pretrained_rqvae_path,
+        rqvae_hf_model_path=pretrained_rqvae_hf_path,
         rqvae_codebook_normalize=vae_codebook_normalize,
         rqvae_sim_vq=vae_sim_vq,
     )
