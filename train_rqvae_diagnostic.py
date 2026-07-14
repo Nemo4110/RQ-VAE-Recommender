@@ -558,6 +558,7 @@ def train(
     epoch_hashes = epoch_plan_hashes(dataset_item_count, seed, 500)
     epoch_rolling_hash = rolling_epoch_plan_hash(dataset_item_count, seed, 500)
     common_hash: str | None = None
+    training_item_count: int | None = None
     model: torch.nn.Module | None = None
     optimizer: torch.optim.Optimizer | None = None
     spec: OptimizerSpec | None = None
@@ -671,7 +672,7 @@ def train(
             "dataset": "amazon-beauty",
             "dataset_split": dataset_split,
             "dataset_item_count": dataset_item_count,
-            "training_item_count": len(training_dataset) if "training_dataset" in locals() else None,
+            "training_item_count": training_item_count,
             "model": {
                 "name": "RQ-VAE",
                 "input_dim": vae_input_dim,
@@ -744,6 +745,7 @@ def train(
         training_dataset: Dataset = canonical_dataset
         if max_items is not None:
             training_dataset = Subset(canonical_dataset, range(max_items))
+        training_item_count = len(training_dataset)
         seed_all(seed)
         model = build_paper_model(
             input_dim=vae_input_dim,

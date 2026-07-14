@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -230,3 +231,75 @@ def test_resume_history_rejects_any_extra_tail(tmp_path: Path) -> None:
             expected_record_count=count,
             expected_rolling_hash=rolling_hash,
         )
+
+
+class _SizedDataset:
+    def __len__(self) -> int:
+        return 12101
+
+
+def _patch_summary_failure_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(trainer.torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(trainer.torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(trainer.torch.cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(trainer, "_device_metadata", lambda device: {"type": "cuda"})
+    monkeypatch.setattr(trainer, "_external_metadata", lambda: {"commit": "test"})
+
+
+def test_failed_summary_records_loaded_training_dataset_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_summary_failure_runtime(monkeypatch)
+    monkeypatch.setattr(trainer, "_load_dataset", lambda *args: _SizedDataset())
+    monkeypatch.setattr(
+        trainer,
+        "build_paper_model",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("model build failed")),
+    )
+    save_root = tmp_path / "loaded-failure"
+
+    with pytest.raises(RuntimeError, match="model build failed"):
+        trainer.train(
+            save_dir_root=str(save_root),
+            common_initialization_path=str(tmp_path / "common.pt"),
+            run_stop_utc="2099-01-01T00:00:00Z",
+        )
+
+    summary = json.loads((save_root / "summary.json").read_text())
+    assert summary["dataset_item_count"] == 12101
+    assert summary["training_item_count"] == 2048
+
+
+def test_failed_summary_before_dataset_load_keeps_training_size_null(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_summary_failure_runtime(monkeypatch)
+    monkeypatch.setattr(
+        trainer,
+        "_load_dataset",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("dataset load failed")),
+    )
+    save_root = tmp_path / "preload-failure"
+
+    with pytest.raises(RuntimeError, match="dataset load failed"):
+        trainer.train(
+            save_dir_root=str(save_root),
+            common_initialization_path=str(tmp_path / "common.pt"),
+            run_stop_utc="2099-01-01T00:00:00Z",
+        )
+
+    summary = json.loads((save_root / "summary.json").read_text())
+    assert summary["dataset_item_count"] == 12101
+    assert summary["training_item_count"] is None
+
+
+
+def test_summary_does_not_probe_nested_locals_for_dataset_state() -> None:
+    source = inspect.getsource(trainer.train)
+    assert '"training_dataset" in locals()' not in source
+    assert '"training_item_count": training_item_count' in source
