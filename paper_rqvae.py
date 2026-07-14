@@ -9,6 +9,9 @@ from torch import nn
 from torch.optim import Adagrad
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from modules.tokenizer.fixed_collision import FixedCollisionOverflow
+from modules.tokenizer.fixed_collision import analyze_three_token_ids
+from modules.tokenizer.fixed_collision import build_fixed_four_token_ids
 
 
 def build_paper_optimizer(model: nn.Module, learning_rate: float = 0.4) -> Adagrad:
@@ -84,3 +87,50 @@ def load_training_checkpoint(
         "optimizer_step": int(checkpoint["optimizer_step"]),
         "seed": int(checkpoint["seed"]),
     }
+
+
+def compute_corpus_diagnostics(
+    three_token_ids: torch.Tensor,
+    losses_finite: bool = True,
+) -> dict[str, Any]:
+    stats = analyze_three_token_ids(three_token_ids, rq_codebook_size=256)
+    unique_four_token_count = 0
+    collision_gate_passed = False
+    try:
+        fixed = build_fixed_four_token_ids(
+            three_token_ids,
+            collision_cardinality=256,
+        )
+        unique_four_token_count = int(fixed.four_token_ids.shape[0])
+        collision_gate_passed = True
+    except FixedCollisionOverflow:
+        collision_gate_passed = False
+    usage_gate_passed = all(value >= 0.80 for value in stats.codebook_usage)
+    return {
+        "item_count": stats.item_count,
+        "unique_three_token_count": stats.unique_three_token_count,
+        "unique_four_token_count": unique_four_token_count,
+        "max_bucket_size": stats.max_bucket_size,
+        "bucket_size_histogram": stats.bucket_size_histogram,
+        "codebook_usage": list(stats.codebook_usage),
+        "fixed_collision_cardinality": 256,
+        "losses_finite": bool(losses_finite),
+        "collision_gate_passed": collision_gate_passed,
+        "usage_gate_passed": usage_gate_passed,
+        "paper_gate_passed": (
+            collision_gate_passed and usage_gate_passed and bool(losses_finite)
+        ),
+    }
+
+
+def publish_final_checkpoint(
+    checkpoint_path: Path,
+    link_path: Path,
+    *,
+    diagnostics: dict[str, Any],
+) -> None:
+    if not diagnostics.get("paper_gate_passed", False):
+        raise ValueError("paper gate must pass before publishing final checkpoint")
+    if link_path.exists() or link_path.is_symlink():
+        raise FileExistsError(f"refusing to overwrite {link_path}")
+    link_path.symlink_to(checkpoint_path.resolve())
