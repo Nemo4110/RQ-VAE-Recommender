@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import rqvae_collapse_diagnostics as diagnostics
 from rqvae_collapse_diagnostics import (
     OptimizerSpec,
     build_diagnostic_optimizer,
@@ -82,6 +83,112 @@ def test_optimizer_specs_are_frozen_and_have_exact_factory_values() -> None:
     }
     with pytest.raises(FrozenInstanceError):
         default.learning_rate = 0.1  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("learning_rate", 0),
+        ("weight_decay", 0),
+        ("eps", 0),
+        ("initial_accumulator_value", 0),
+        ("weight_decay", False),
+        ("betas", [0.9, 0.999]),
+        ("betas", (0.9, False)),
+    ],
+)
+def test_raw_optimizer_specs_reject_non_exact_runtime_types(
+    field: str,
+    value: object,
+) -> None:
+    fields = asdict(OptimizerSpec.adagrad_default())
+    if field == "betas":
+        fields = asdict(OptimizerSpec.adamw_author())
+    fields[field] = value
+    spec = OptimizerSpec(**fields)
+
+    with pytest.raises(ValueError, match=field):
+        build_diagnostic_optimizer(nn.Linear(3, 2), spec)
+    with pytest.raises(ValueError, match=field):
+        optimizer_treatment_hash(spec)
+
+
+@pytest.mark.parametrize(
+    ("config_fields", "expected"),
+    [
+        (
+            {
+                "optimizer_name": "adagrad",
+                "learning_rate": 0.4,
+                "weight_decay": 0,
+                "optimizer_eps": 1e-10,
+                "initial_accumulator_value": 0,
+                "adam_betas": None,
+            },
+            OptimizerSpec.adagrad_default(),
+        ),
+        (
+            {
+                "optimizer_name": "adagrad",
+                "learning_rate": 0.4,
+                "weight_decay": 0,
+                "optimizer_eps": 1e-7,
+                "initial_accumulator_value": 0.1,
+                "adam_betas": None,
+            },
+            OptimizerSpec.adagrad_accum01_eps1e7(),
+        ),
+        (
+            {
+                "optimizer_name": "adamw",
+                "learning_rate": 1e-3,
+                "weight_decay": 1e-4,
+                "optimizer_eps": 1e-8,
+                "initial_accumulator_value": None,
+                "adam_betas": [0.9, 0.999],
+            },
+            OptimizerSpec.adamw_author(),
+        ),
+    ],
+)
+def test_from_config_fields_normalizes_gin_values_to_canonical_specs(
+    config_fields: dict[str, object],
+    expected: OptimizerSpec,
+) -> None:
+    spec = OptimizerSpec.from_config_fields(**config_fields)
+
+    assert spec == expected
+    assert asdict(spec) == asdict(expected)
+    assert optimizer_treatment_payload(spec) == optimizer_treatment_payload(expected)
+    assert optimizer_treatment_hash(spec) == optimizer_treatment_hash(expected)
+
+
+@pytest.mark.parametrize(
+    "config_fields",
+    [
+        {
+            "optimizer_name": "adagrad",
+            "learning_rate": 0.4,
+            "weight_decay": False,
+            "optimizer_eps": 1e-10,
+            "initial_accumulator_value": 0,
+            "adam_betas": None,
+        },
+        {
+            "optimizer_name": "adamw",
+            "learning_rate": 1e-3,
+            "weight_decay": 1e-4,
+            "optimizer_eps": 1e-8,
+            "initial_accumulator_value": None,
+            "adam_betas": "0.9,0.999",
+        },
+    ],
+)
+def test_from_config_fields_rejects_invalid_gin_types(
+    config_fields: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="optimizer"):
+        OptimizerSpec.from_config_fields(**config_fields)
 
 
 @pytest.mark.parametrize(
@@ -183,6 +290,20 @@ def test_optimizer_metadata_records_live_defaults_and_has_stable_hash() -> None:
     assert optimizer_metadata_hash(adagrad) != optimizer_metadata_hash(adamw)
 
 
+def test_equivalent_live_optimizers_have_identical_metadata_hashes() -> None:
+    first = build_diagnostic_optimizer(
+        nn.Linear(3, 2),
+        OptimizerSpec.adagrad_default(),
+    )
+    second = build_diagnostic_optimizer(
+        nn.Linear(3, 2),
+        OptimizerSpec.adagrad_default(),
+    )
+
+    assert optimizer_metadata(first) == optimizer_metadata(second)
+    assert optimizer_metadata_hash(first) == optimizer_metadata_hash(second)
+
+
 def test_canonical_json_is_sorted_compact_and_hashes_its_utf8_bytes() -> None:
     payload = {"z": 2, "a": (1, "x")}
 
@@ -190,6 +311,17 @@ def test_canonical_json_is_sorted_compact_and_hashes_its_utf8_bytes() -> None:
 
     assert canonical == '{"a":[1,"x"],"z":2}'
     assert hash_json(payload) == sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_nonfinite_floats(value: float) -> None:
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_json({"value": value})
+
+
+def test_config_field_collections_are_immutable() -> None:
+    assert isinstance(diagnostics.INITIALIZATION_CONFIG_FIELDS, frozenset)
+    assert isinstance(diagnostics._INVARIANT_EXCLUDED_FIELDS, frozenset)
 
 
 def test_same_stage_arms_share_invariant_bytes_hash_and_initialization() -> None:
