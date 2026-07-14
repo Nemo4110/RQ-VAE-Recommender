@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch import Tensor
 from torch import nn
+from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data import TensorDataset
 
@@ -1141,3 +1142,179 @@ def test_common_initialization_round_trip_validation_and_exclusive_publish(
     assert diagnostics.hash_rng_state(
         diagnostics.capture_rng_state()
     ) == untouched_rng_hash
+
+
+
+def _tiny_diagnostic_rqvae() -> RqVae:
+    return RqVae(
+        input_dim=4, embed_dim=2, hidden_dims=[3], codebook_size=256,
+        codebook_kmeans_init=False, codebook_normalize=False,
+        codebook_sim_vq=False, codebook_mode=QuantizeForwardMode.STE,
+        n_layers=3, commitment_weight=0.25, n_cat_features=0,
+    )
+
+
+def test_distribution_stats_use_population_variance_and_fixed_quantiles() -> None:
+    inputs = torch.tensor([[0.0, 0.0], [2.0, 4.0]])
+    assert diagnostics.input_distribution_stats(inputs) == pytest.approx({
+        "global_variance": 2.75, "mean_feature_variance": 2.5,
+        "norm_mean": (20.0**0.5) / 2, "norm_std": (20.0**0.5) / 2,
+        "norm_min": 0.0, "norm_max": 20.0**0.5,
+    })
+    encoded = torch.tensor([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]])
+    stats = diagnostics.encoder_distribution_stats(encoded)
+    assert stats["global_variance"] == pytest.approx(encoded.var(unbiased=False).item())
+    assert [stats[f"norm_p{x}"] for x in ("00", "50", "95", "99", "100")] == pytest.approx([0, 5, 9.5, 9.9, 10])
+    residual = diagnostics.residual_distribution_stats([encoded])[0]
+    assert residual == pytest.approx({
+        "variance": encoded.var(unbiased=False).item(),
+        "norm_mean": 5.0, "norm_p50": 5.0, "norm_p95": 9.5,
+    })
+
+
+def test_assignment_diagnostics_cover_collapse_balance_nearest_rank_and_overflow() -> None:
+    collapsed = diagnostics.assignment_diagnostics(torch.zeros((100, 3), dtype=torch.long))
+    assert collapsed["used_counts"] == [1, 1, 1]
+    assert [x["normalized_entropy"] for x in collapsed["layers"]] == [0, 0, 0]
+    assert [x["top1_mass"] for x in collapsed["layers"]] == [1, 1, 1]
+    assert (
+        collapsed["unique_three_token_count"],
+        collapsed["unique_four_token_count"],
+        collapsed["max_bucket_size"],
+        collapsed["bucket_size_p50"],
+        collapsed["bucket_size_p95"],
+        collapsed["bucket_size_p99"],
+        collapsed["collision_gate_passed"],
+        collapsed["hard_collapse"],
+    ) == (1, 100, 100, 100, 100, 100, True, True)
+
+    codes = torch.arange(256)
+    balanced = diagnostics.assignment_diagnostics(torch.stack([codes] * 3, dim=1))
+    assert balanced["used_counts"] == [256, 256, 256]
+    assert [x["normalized_entropy"] for x in balanced["layers"]] == pytest.approx([1] * 3)
+    assert [x["top1_mass"] for x in balanced["layers"]] == pytest.approx([1 / 256] * 3)
+    assert (balanced["unique_three_token_count"], balanced["max_bucket_size"], balanced["hard_collapse"]) == (256, 1, False)
+    assert balanced["paper_gate_passed"] is False
+
+    rows = [[code] * 3 for code, size in enumerate([1, 2, 3, 4, 20]) for _ in range(size)]
+    ranked = diagnostics.assignment_diagnostics(torch.tensor(rows))
+    assert [ranked[f"bucket_size_p{x}"] for x in (50, 95, 99)] == [3, 20, 20]
+
+    overflow = diagnostics.assignment_diagnostics(torch.zeros((257, 3), dtype=torch.long))
+    assert overflow["unique_four_token_count"] == 0
+    assert overflow["collision_gate_passed"] is False
+    assert overflow["fixed_collision_cardinality"] == 256
+
+
+@pytest.mark.parametrize(("epochs", "status", "expected"), [
+    ({100: False, 250: False, 500: False}, "complete", "never"),
+    ({25: True, 100: False, 250: False, 500: False}, "complete", "transient_recovered"),
+    ({100: False, 250: False, 500: True}, "complete", "final_only"),
+    ({100: True, 250: True, 500: True}, "complete", "sustained"),
+    ({100: False, 250: False}, "complete", "not_evaluable"),
+    ({100: True, 250: True, 500: True}, "deadline_stop", "not_evaluable"),
+])
+def test_classify_collapse_fixed_semantics(epochs: dict[int, bool], status: str, expected: str) -> None:
+    value = diagnostics.classify_collapse(epochs, failure_status=diagnostics.FailureStatus(status))
+    assert value["collapse_class"] == expected
+    if expected == "not_evaluable":
+        assert value["final_hard_collapse"] is None
+        assert value["sustained_hard_collapse"] is None
+
+
+def test_triggers_are_step_first() -> None:
+    assert diagnostics.scheduled_snapshot_triggers(
+        optimizer_step=12, completed_epoch=1,
+        step_schedule=frozenset({0, 12}), epoch_schedule=frozenset({1, 2}),
+    ) == ("optimizer_step:12", "epoch:1")
+
+
+def test_group_gradient_and_delta_diagnostics_only_measure_expected_update() -> None:
+    model = _tiny_diagnostic_rqvae()
+    groups = diagnostics.parameter_groups(model)
+    assert list(groups) == ["encoder", "decoder"] + [f"layers.{i}.embedding.weight" for i in range(3)]
+    names = [name for group in groups.values() for name, _ in group]
+    assert sorted(names) == sorted(name for name, p in model.named_parameters() if p.requires_grad)
+    assert all(all(value is None for value in stats.values()) for stats in diagnostics.gradient_group_stats(groups).values())
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    model_before = diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model))
+    optimizer_before = diagnostics.hash_nested_state(optimizer.state_dict())
+    sum(p.square().sum() for p in model.parameters()).backward()
+    gradients = diagnostics.gradient_group_stats(groups)
+    assert all(x["nonfinite_fraction"] == 0 and x["l2_norm"] is not None for x in gradients.values())
+    assert diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model)) == model_before
+    assert diagnostics.hash_nested_state(optimizer.state_dict()) == optimizer_before
+
+    before = diagnostics.clone_group_parameters(groups)
+    optimizer.step()
+    model_after = diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model))
+    optimizer_after = diagnostics.hash_nested_state(optimizer.state_dict())
+    deltas = diagnostics.parameter_delta_stats(groups, before)
+    assert all(x["delta_l2"] > 0 and x["relative_update"] > 0 for x in deltas.values())
+    assert diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model)) == model_after != model_before
+    assert diagnostics.hash_nested_state(optimizer.state_dict()) == optimizer_after != optimizer_before
+
+    for _, parameter in groups["encoder"]:
+        parameter.grad = torch.zeros_like(parameter)
+    groups["encoder"][0][1].grad.reshape(-1)[0] = float("inf")
+    nonfinite = diagnostics.gradient_group_stats(groups)["encoder"]
+    assert nonfinite["l2_norm"] is None and nonfinite["max_abs"] is None
+    assert nonfinite["nonfinite_fraction"] > 0
+
+
+def test_parameter_groups_reject_unassigned_trainable_parameters() -> None:
+    model = _tiny_diagnostic_rqvae()
+    model.extra = nn.Parameter(torch.ones(1))
+    with pytest.raises(ValueError, match="unassigned trainable"):
+        diagnostics.parameter_groups(model)
+
+
+def test_codebook_stats_compare_baseline_without_mutation() -> None:
+    model = _tiny_diagnostic_rqvae()
+    baseline = diagnostics.clone_cpu_state_dict(model)
+    baseline_hash = diagnostics.hash_state_dict(baseline)
+    with torch.no_grad():
+        model.layers[1].embedding.weight.add_(0.5)
+    model_hash = diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model))
+    stats = diagnostics.codebook_weight_stats(model, baseline)
+    assert list(stats) == [f"layers.{i}.embedding.weight" for i in range(3)]
+    assert stats["layers.0.embedding.weight"]["movement_l2"] == 0
+    assert stats["layers.1.embedding.weight"]["movement_l2"] > 0
+    assert diagnostics.hash_state_dict(baseline) == baseline_hash
+    assert diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model)) == model_hash
+
+
+def test_read_only_snapshot_restores_model_optimizer_rng_loader_and_epoch_plan() -> None:
+    diagnostics.seed_all(20260701)
+    model = _tiny_diagnostic_rqvae()
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    inputs = torch.arange(32, dtype=torch.float32).reshape(8, 4) / 31
+    generator = torch.Generator().manual_seed(1234)
+    loader = DataLoader(TensorDataset(inputs), batch_size=3, shuffle=False, num_workers=0, generator=generator)
+    baseline = diagnostics.clone_cpu_state_dict(model)
+    before = (
+        diagnostics.hash_state_dict(baseline),
+        diagnostics.hash_nested_state(optimizer.state_dict()),
+        diagnostics.hash_rng_state(diagnostics.capture_rng_state()),
+        diagnostics.hash_tensor(generator.get_state()),
+        diagnostics.rolling_epoch_plan_hash(8, 20260701, 5),
+    )
+    snapshot = diagnostics.capture_read_only_corpus_snapshot(
+        model=model, optimizer=optimizer, canonical_loader=loader,
+        diagnostic_loader_generator=generator, post_kmeans_state=baseline,
+        optimizer_step=0, completed_epoch=None, triggers=("optimizer_step:0",),
+    )
+    assert snapshot["optimizer_step"] == 0 and snapshot["completed_epoch"] is None
+    assert snapshot["triggers"] == ["optimizer_step:0"] and snapshot["item_count"] == 8
+    assert set(snapshot) >= {"input_distribution", "encoder_distribution", "residual_distributions", "assignment_diagnostics", "codebook_weight_stats"}
+    after = (
+        diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model)),
+        diagnostics.hash_nested_state(optimizer.state_dict()),
+        diagnostics.hash_rng_state(diagnostics.capture_rng_state()),
+        diagnostics.hash_tensor(generator.get_state()),
+        diagnostics.rolling_epoch_plan_hash(8, 20260701, 5),
+    )
+    assert model.training is True
+    assert after == before

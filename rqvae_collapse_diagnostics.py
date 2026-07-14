@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 import struct
@@ -11,6 +12,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import asdict
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from typing import TypedDict
@@ -19,7 +21,11 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch import nn
+from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+
+from modules.tokenizer.fixed_collision import FixedCollisionOverflow
+from modules.tokenizer.fixed_collision import build_fixed_four_token_ids
 
 
 INITIALIZATION_CONFIG_FIELDS = frozenset(
@@ -1155,3 +1161,525 @@ def load_common_initialization(
         layer.kmeans_initted = True
     restore_rng_state(rng_training)
     return dict(artifact)
+
+
+
+class FailureStatus(str, Enum):
+    COMPLETE = "complete"
+    NUMERICAL_FAILURE = "numerical_failure"
+    OOM = "oom"
+    INVARIANT_MISMATCH = "invariant_mismatch"
+    DEADLINE_STOP = "deadline_stop"
+    OUTPUT_EXISTS = "output_exists"
+    INTERRUPTED = "interrupted"
+    RUNTIME_ERROR = "runtime_error"
+
+
+class CollapseClass(str, Enum):
+    NEVER = "never"
+    TRANSIENT_RECOVERED = "transient_recovered"
+    FINAL_ONLY = "final_only"
+    SUSTAINED = "sustained"
+    NOT_EVALUABLE = "not_evaluable"
+
+
+def _require_nonempty_matrix(field_name: str, values: Tensor) -> Tensor:
+    if not isinstance(values, Tensor):
+        raise TypeError(f"{field_name} must be a torch.Tensor")
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError(f"{field_name} must be a nonempty two-dimensional tensor")
+    return values.detach().float()
+
+
+def _linear_norm_quantiles(
+    values: Tensor,
+    quantiles: Sequence[float],
+) -> list[float]:
+    norms = values.norm(dim=1)
+    return [
+        float(torch.quantile(norms, quantile, interpolation="linear").item())
+        for quantile in quantiles
+    ]
+
+
+def input_distribution_stats(inputs: Tensor) -> dict[str, Any]:
+    values = _require_nonempty_matrix("inputs", inputs)
+    norms = values.norm(dim=1)
+    return {
+        "global_variance": float(values.var(unbiased=False).item()),
+        "mean_feature_variance": float(
+            values.var(dim=0, unbiased=False).mean().item()
+        ),
+        "norm_mean": float(norms.mean().item()),
+        "norm_std": float(norms.std(unbiased=False).item()),
+        "norm_min": float(norms.min().item()),
+        "norm_max": float(norms.max().item()),
+    }
+
+
+def encoder_distribution_stats(encoded: Tensor) -> dict[str, Any]:
+    values = _require_nonempty_matrix("encoded", encoded)
+    p00, p50, p95, p99, p100 = _linear_norm_quantiles(
+        values,
+        (0.0, 0.50, 0.95, 0.99, 1.0),
+    )
+    return {
+        "global_variance": float(values.var(unbiased=False).item()),
+        "norm_p00": p00,
+        "norm_p50": p50,
+        "norm_p95": p95,
+        "norm_p99": p99,
+        "norm_p100": p100,
+    }
+
+
+def residual_distribution_stats(
+    residuals_by_layer: Sequence[Tensor],
+) -> list[dict[str, Any]]:
+    if isinstance(residuals_by_layer, (str, bytes)) or not isinstance(
+        residuals_by_layer,
+        Sequence,
+    ):
+        raise TypeError("residuals_by_layer must be a sequence")
+    stats: list[dict[str, Any]] = []
+    for layer_index, residual in enumerate(residuals_by_layer):
+        values = _require_nonempty_matrix(
+            f"residuals_by_layer[{layer_index}]",
+            residual,
+        )
+        norms = values.norm(dim=1)
+        p50, p95 = _linear_norm_quantiles(values, (0.50, 0.95))
+        stats.append(
+            {
+                "variance": float(values.var(unbiased=False).item()),
+                "norm_mean": float(norms.mean().item()),
+                "norm_p50": p50,
+                "norm_p95": p95,
+            }
+        )
+    if not stats:
+        raise ValueError("residuals_by_layer must not be empty")
+    return stats
+
+
+def _nearest_rank(values: Tensor, quantile: float) -> int:
+    ordered = values.detach().to(device="cpu", dtype=torch.long).sort().values
+    rank = max(1, math.ceil(quantile * ordered.numel()))
+    return int(ordered[rank - 1].item())
+
+
+def assignment_diagnostics(
+    semantic_ids: Tensor,
+    *,
+    codebook_size: int = 256,
+) -> dict[str, Any]:
+    if type(codebook_size) is not int or codebook_size != 256:
+        raise ValueError("diagnostic codebook_size must equal paper-strict 256")
+    if not isinstance(semantic_ids, Tensor):
+        raise TypeError("semantic_ids must be a torch.Tensor")
+    codes = semantic_ids.detach().to(device="cpu", dtype=torch.long)
+    if codes.ndim != 2 or codes.shape[1] != 3 or codes.shape[0] == 0:
+        raise ValueError("semantic_ids must have shape [items, 3] and be nonempty")
+    if int(codes.min().item()) < 0 or int(codes.max().item()) >= codebook_size:
+        raise ValueError("semantic IDs must be within the codebook range")
+
+    item_count = int(codes.shape[0])
+    layer_stats: list[dict[str, Any]] = []
+    for layer_index in range(codes.shape[1]):
+        counts = torch.bincount(codes[:, layer_index], minlength=codebook_size)
+        probabilities = counts.float() / counts.sum()
+        nonzero = probabilities[probabilities > 0]
+        entropy = float(-(nonzero * nonzero.log()).sum().item())
+        used_count = int((counts > 0).sum().item())
+        layer_stats.append(
+            {
+                "layer_index": layer_index,
+                "used_count": used_count,
+                "used_ratio": used_count / codebook_size,
+                "entropy": entropy,
+                "normalized_entropy": entropy / math.log(codebook_size),
+                "top1_mass": float(probabilities.max().item()),
+                "top10_mass": float(
+                    probabilities.topk(min(10, len(probabilities))).values.sum().item()
+                ),
+            }
+        )
+
+    _, bucket_sizes = torch.unique(codes, dim=0, return_counts=True)
+    unique_three_token_count = int(bucket_sizes.numel())
+    max_bucket_size = int(bucket_sizes.max().item())
+    collision_gate_passed = True
+    try:
+        fixed = build_fixed_four_token_ids(
+            codes,
+            collision_cardinality=256,
+        )
+        unique_four_token_count = int(
+            torch.unique(fixed.four_token_ids, dim=0).shape[0]
+        )
+    except FixedCollisionOverflow:
+        collision_gate_passed = False
+        unique_four_token_count = 0
+
+    used_counts = [int(layer["used_count"]) for layer in layer_stats]
+    used_ratios = [float(layer["used_ratio"]) for layer in layer_stats]
+    hard_collapse = (
+        max_bucket_size / item_count >= 0.90
+        or any(
+            used_count * 100 <= codebook_size
+            for used_count in used_counts
+        )
+    )
+    local_promising = (
+        all(ratio >= 0.20 for ratio in used_ratios)
+        and unique_three_token_count >= 1024
+        and max_bucket_size <= 256
+    )
+    paper_gate_passed = (
+        all(ratio >= 0.80 for ratio in used_ratios)
+        and max_bucket_size <= 256
+        and unique_four_token_count == 12101
+    )
+    return {
+        "item_count": item_count,
+        "codebook_size": codebook_size,
+        "layers": layer_stats,
+        "used_counts": used_counts,
+        "used_ratios": used_ratios,
+        "unique_three_token_count": unique_three_token_count,
+        "unique_four_token_count": unique_four_token_count,
+        "max_bucket_size": max_bucket_size,
+        "fixed_collision_cardinality": 256,
+        "collision_gate_passed": collision_gate_passed,
+        "bucket_size_p50": _nearest_rank(bucket_sizes, 0.50),
+        "bucket_size_p95": _nearest_rank(bucket_sizes, 0.95),
+        "bucket_size_p99": _nearest_rank(bucket_sizes, 0.99),
+        "hard_collapse": hard_collapse,
+        "local_promising": local_promising,
+        "paper_gate_passed": paper_gate_passed,
+    }
+
+
+def parameter_groups(
+    model: nn.Module,
+) -> dict[str, list[tuple[str, nn.Parameter]]]:
+    keys = [
+        "encoder",
+        "decoder",
+        "layers.0.embedding.weight",
+        "layers.1.embedding.weight",
+        "layers.2.embedding.weight",
+    ]
+    groups: dict[str, list[tuple[str, nn.Parameter]]] = {
+        key: [] for key in keys
+    }
+    unassigned: list[str] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("encoder."):
+            group_name = "encoder"
+        elif name.startswith("decoder."):
+            group_name = "decoder"
+        elif name in groups and name.startswith("layers."):
+            group_name = name
+        else:
+            unassigned.append(name)
+            continue
+        groups[group_name].append((name, parameter))
+    if unassigned:
+        raise ValueError(f"unassigned trainable parameters: {sorted(unassigned)}")
+    empty = [name for name, values in groups.items() if not values]
+    if empty:
+        raise ValueError(f"required parameter groups are empty: {empty}")
+    return groups
+
+
+def gradient_group_stats(
+    groups: Mapping[str, Sequence[tuple[str, nn.Parameter]]],
+) -> dict[str, dict[str, float | None]]:
+    result: dict[str, dict[str, float | None]] = {}
+    for group_name, named_parameters in groups.items():
+        parameters = list(named_parameters)
+        if not parameters:
+            raise ValueError(f"parameter group {group_name} must not be empty")
+        total_count = sum(parameter.numel() for _, parameter in parameters)
+        present = [parameter.grad for _, parameter in parameters if parameter.grad is not None]
+        if not present:
+            result[group_name] = {
+                "l2_norm": None,
+                "max_abs": None,
+                "exact_zero_fraction": None,
+                "nonfinite_fraction": None,
+            }
+            continue
+        zero_count = sum(
+            parameter.numel()
+            for _, parameter in parameters
+            if parameter.grad is None
+        )
+        nonfinite_count = 0
+        squared_sum = 0.0
+        max_abs = 0.0
+        for gradient in present:
+            value = gradient.detach()
+            finite = torch.isfinite(value)
+            nonfinite_count += int((~finite).sum().item())
+            zero_count += int((value == 0).sum().item())
+            if bool(finite.all().item()):
+                squared_sum += float(value.double().square().sum().item())
+                max_abs = max(max_abs, float(value.abs().max().item()))
+        nonfinite_fraction = nonfinite_count / total_count
+        result[group_name] = {
+            "l2_norm": None if nonfinite_count else math.sqrt(squared_sum),
+            "max_abs": None if nonfinite_count else max_abs,
+            "exact_zero_fraction": zero_count / total_count,
+            "nonfinite_fraction": nonfinite_fraction,
+        }
+    return result
+
+
+def clone_group_parameters(
+    groups: Mapping[str, Sequence[tuple[str, nn.Parameter]]],
+) -> dict[str, list[Tensor]]:
+    return {
+        group_name: [parameter.detach().clone() for _, parameter in values]
+        for group_name, values in groups.items()
+    }
+
+
+def parameter_delta_stats(
+    groups: Mapping[str, Sequence[tuple[str, nn.Parameter]]],
+    before: Mapping[str, Sequence[Tensor]],
+) -> dict[str, dict[str, float]]:
+    if set(groups) != set(before):
+        raise ValueError("parameter delta group keys differ")
+    result: dict[str, dict[str, float]] = {}
+    for group_name, named_parameters in groups.items():
+        parameters = list(named_parameters)
+        previous = list(before[group_name])
+        if len(parameters) != len(previous):
+            raise ValueError(f"parameter delta group length differs for {group_name}")
+        delta_squared = 0.0
+        pre_squared = 0.0
+        for (name, parameter), old in zip(parameters, previous, strict=True):
+            if not isinstance(old, Tensor) or old.shape != parameter.shape:
+                raise ValueError(f"parameter delta shape differs for {name}")
+            old_on_device = old.detach().to(
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            delta_squared += float(
+                (parameter.detach() - old_on_device).double().square().sum().item()
+            )
+            pre_squared += float(old_on_device.double().square().sum().item())
+        delta_l2 = math.sqrt(delta_squared)
+        pre_update_l2 = math.sqrt(pre_squared)
+        result[group_name] = {
+            "delta_l2": delta_l2,
+            "pre_update_parameter_l2": pre_update_l2,
+            "relative_update": delta_l2 / max(pre_update_l2, 1e-12),
+        }
+    return result
+
+
+def codebook_weight_stats(
+    model: nn.Module,
+    post_kmeans_state: Mapping[str, Tensor],
+) -> dict[str, dict[str, float]]:
+    parameters = dict(model.named_parameters())
+    result: dict[str, dict[str, float]] = {}
+    for layer_index in range(3):
+        name = f"layers.{layer_index}.embedding.weight"
+        if name not in parameters or name not in post_kmeans_state:
+            raise ValueError(f"missing codebook baseline for {name}")
+        value = parameters[name].detach()
+        baseline = post_kmeans_state[name].detach().to(
+            device=value.device,
+            dtype=value.dtype,
+        )
+        if value.shape != baseline.shape:
+            raise ValueError(f"codebook baseline shape differs for {name}")
+        result[name] = {
+            "weight_variance": float(value.float().var(unbiased=False).item()),
+            "weight_l2_norm": float(value.double().norm().item()),
+            "movement_l2": float((value - baseline).double().norm().item()),
+        }
+    return result
+
+
+def scheduled_snapshot_triggers(
+    *,
+    optimizer_step: int,
+    completed_epoch: int | None,
+    step_schedule: frozenset[int],
+    epoch_schedule: frozenset[int],
+) -> tuple[str, ...]:
+    if type(optimizer_step) is not int or optimizer_step < 0:
+        raise ValueError("optimizer_step must be a nonnegative int")
+    if completed_epoch is not None and (
+        type(completed_epoch) is not int or completed_epoch < 0
+    ):
+        raise ValueError("completed_epoch must be a nonnegative int or None")
+    if type(step_schedule) is not frozenset or any(
+        type(value) is not int or value < 0 for value in step_schedule
+    ):
+        raise ValueError("step_schedule must be a frozenset of nonnegative ints")
+    if type(epoch_schedule) is not frozenset or any(
+        type(value) is not int or value <= 0 for value in epoch_schedule
+    ):
+        raise ValueError("epoch_schedule must be a frozenset of positive ints")
+    triggers: list[str] = []
+    if optimizer_step in step_schedule:
+        triggers.append(f"optimizer_step:{optimizer_step}")
+    if completed_epoch is not None and completed_epoch in epoch_schedule:
+        triggers.append(f"epoch:{completed_epoch}")
+    return tuple(triggers)
+
+
+def classify_collapse(
+    epoch_hard_collapse: Mapping[int, bool],
+    *,
+    failure_status: FailureStatus,
+) -> dict[str, Any]:
+    if not isinstance(epoch_hard_collapse, Mapping) or any(
+        type(epoch) is not int
+        or epoch <= 0
+        or type(value) is not bool
+        for epoch, value in epoch_hard_collapse.items()
+    ):
+        raise ValueError("epoch_hard_collapse must map positive ints to bools")
+    if not isinstance(failure_status, FailureStatus):
+        raise TypeError("failure_status must be a FailureStatus")
+    ever = any(epoch_hard_collapse.values())
+    if failure_status is not FailureStatus.COMPLETE or 500 not in epoch_hard_collapse:
+        return {
+            "ever_hard_collapse": ever,
+            "final_hard_collapse": None,
+            "sustained_hard_collapse": None,
+            "collapse_class": CollapseClass.NOT_EVALUABLE.value,
+            "failure_status": failure_status.value,
+        }
+    final = epoch_hard_collapse[500]
+    sustained = all(epoch_hard_collapse.get(epoch, False) for epoch in (100, 250, 500))
+    if sustained:
+        collapse_class = CollapseClass.SUSTAINED
+    elif final:
+        collapse_class = CollapseClass.FINAL_ONLY
+    elif ever:
+        collapse_class = CollapseClass.TRANSIENT_RECOVERED
+    else:
+        collapse_class = CollapseClass.NEVER
+    return {
+        "ever_hard_collapse": ever,
+        "final_hard_collapse": final,
+        "sustained_hard_collapse": sustained,
+        "collapse_class": collapse_class.value,
+        "failure_status": failure_status.value,
+    }
+
+
+def capture_read_only_corpus_snapshot(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    canonical_loader: DataLoader,
+    diagnostic_loader_generator: torch.Generator,
+    post_kmeans_state: Mapping[str, Tensor],
+    optimizer_step: int,
+    completed_epoch: int | None,
+    triggers: Sequence[str],
+) -> dict[str, Any]:
+    if not isinstance(canonical_loader, DataLoader):
+        raise TypeError("canonical_loader must be a DataLoader")
+    if not isinstance(diagnostic_loader_generator, torch.Generator):
+        raise TypeError("diagnostic_loader_generator must be a torch.Generator")
+    if isinstance(triggers, (str, bytes)) or not isinstance(triggers, Sequence):
+        raise TypeError("triggers must be a sequence of strings")
+    trigger_list = list(triggers)
+    if any(type(value) is not str for value in trigger_list):
+        raise TypeError("triggers must contain only strings")
+
+    was_training = model.training
+    model_hash_before = hash_state_dict(clone_cpu_state_dict(model))
+    optimizer_hash_before = hash_nested_state(optimizer.state_dict())
+    rng_before = capture_rng_state()
+    rng_hash_before = hash_rng_state(rng_before)
+    generator_state = diagnostic_loader_generator.get_state().detach().cpu().clone()
+    generator_hash_before = hash_tensor(generator_state)
+
+    all_inputs: list[Tensor] = []
+    all_encoded: list[Tensor] = []
+    all_semantic_ids: list[Tensor] = []
+    residuals_by_layer: list[list[Tensor]] | None = None
+    try:
+        model.eval()
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            for batch in canonical_loader:
+                inputs = _extract_item_tensor(batch)
+                device_inputs = inputs.to(device)
+                encoded = model.encode(device_inputs)
+                output = model.get_semantic_ids(device_inputs)
+                all_inputs.append(inputs.detach().cpu())
+                all_encoded.append(encoded.detach().cpu())
+                all_semantic_ids.append(output.sem_ids.detach().cpu())
+                residual_layers = list(output.residuals.unbind(dim=-1))
+                if residuals_by_layer is None:
+                    residuals_by_layer = [list() for _ in residual_layers]
+                if len(residual_layers) != len(residuals_by_layer):
+                    raise ValueError("RQ-VAE residual layer count changed across batches")
+                for values, residual in zip(
+                    residuals_by_layer,
+                    residual_layers,
+                    strict=True,
+                ):
+                    values.append(residual.detach().cpu())
+    finally:
+        diagnostic_loader_generator.set_state(generator_state)
+        restore_rng_state(rng_before)
+        model.train(was_training)
+
+    if not all_inputs or residuals_by_layer is None:
+        raise ValueError("canonical_loader must yield at least one batch")
+    model_hash_after = hash_state_dict(clone_cpu_state_dict(model))
+    optimizer_hash_after = hash_nested_state(optimizer.state_dict())
+    rng_hash_after = hash_rng_state(capture_rng_state())
+    generator_hash_after = hash_tensor(diagnostic_loader_generator.get_state())
+    checks = {
+        "model_hash": model_hash_after == model_hash_before,
+        "optimizer_state_hash": optimizer_hash_after == optimizer_hash_before,
+        "rng_hash": rng_hash_after == rng_hash_before,
+        "diagnostic_loader_generator_hash": (
+            generator_hash_after == generator_hash_before
+        ),
+    }
+    if not all(checks.values()):
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        raise RuntimeError(f"read-only corpus diagnostics mutated state: {failed}")
+
+    inputs = torch.cat(all_inputs, dim=0)
+    encoded = torch.cat(all_encoded, dim=0)
+    semantic_ids = torch.cat(all_semantic_ids, dim=0)
+    residuals = [torch.cat(values, dim=0) for values in residuals_by_layer]
+    return {
+        "optimizer_step": optimizer_step,
+        "completed_epoch": completed_epoch,
+        "triggers": trigger_list,
+        "item_count": int(inputs.shape[0]),
+        "input_distribution": input_distribution_stats(inputs),
+        "encoder_distribution": encoder_distribution_stats(encoded),
+        "residual_distributions": residual_distribution_stats(residuals),
+        "assignment_diagnostics": assignment_diagnostics(semantic_ids),
+        "codebook_weight_stats": codebook_weight_stats(
+            model,
+            post_kmeans_state,
+        ),
+        "non_mutation_checks": {
+            "passed": True,
+            "model_hash": model_hash_before,
+            "optimizer_state_hash": optimizer_hash_before,
+            "rng_hash": rng_hash_before,
+            "diagnostic_loader_generator_hash": generator_hash_before,
+        },
+    }
