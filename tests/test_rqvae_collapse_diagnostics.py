@@ -509,20 +509,32 @@ def test_clone_and_hash_state_dict_are_cpu_snapshots() -> None:
     model = nn.Linear(3, 2)
     snapshot = diagnostics.clone_cpu_state_dict(model)
     snapshot_hash = diagnostics.hash_state_dict(snapshot)
-    expected_state_digest = sha256()
-    for name, tensor in sorted(snapshot.items()):
-        expected_state_digest.update(name.encode("utf-8"))
-        expected_state_digest.update(
-            diagnostics.hash_tensor(tensor).encode("ascii")
-        )
 
-    assert snapshot_hash == expected_state_digest.hexdigest()
+    assert snapshot_hash == diagnostics.hash_nested_state(
+        dict(sorted(snapshot.items()))
+    )
     assert all(value.device.type == "cpu" for value in snapshot.values())
     with torch.no_grad():
         model.weight.add_(1)
     assert snapshot_hash == diagnostics.hash_state_dict(snapshot)
     assert snapshot_hash != diagnostics.hash_state_dict(
         diagnostics.clone_cpu_state_dict(model)
+    )
+
+
+def test_state_dict_hash_frames_keys_against_structural_collisions() -> None:
+    first_tensor = torch.tensor([1])
+    second_tensor = torch.tensor([2])
+    first_state = {"a": first_tensor, "b": second_tensor}
+    colliding_unframed_key = (
+        "a" + diagnostics.hash_tensor(first_tensor) + "b"
+    )
+    structurally_different_state = {
+        colliding_unframed_key: second_tensor,
+    }
+
+    assert diagnostics.hash_state_dict(first_state) != diagnostics.hash_state_dict(
+        structurally_different_state
     )
 
 

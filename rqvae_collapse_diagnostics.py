@@ -487,11 +487,9 @@ def _clone_cpu_state_mapping(
 
 
 def hash_state_dict(state: Mapping[str, torch.Tensor]) -> str:
-    digest = hashlib.sha256()
-    for name, tensor in sorted(_clone_cpu_state_mapping(state).items()):
-        digest.update(name.encode("utf-8"))
-        digest.update(hash_tensor(tensor).encode("ascii"))
-    return digest.hexdigest()
+    return hash_nested_state(
+        dict(sorted(_clone_cpu_state_mapping(state).items()))
+    )
 
 
 def _clone_numpy_rng_state(
