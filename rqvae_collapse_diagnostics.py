@@ -8,6 +8,7 @@ import os
 import random
 import struct
 import tempfile
+from collections import defaultdict
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -1752,4 +1753,676 @@ def capture_read_only_corpus_snapshot(
             "rng_hash": rng_hash_before,
             "diagnostic_loader_generator_hash": generator_hash_before,
         },
+    }
+_CHECKPOINT_ARTIFACT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "artifact_kind",
+        "model_state",
+        "optimizer_state",
+        "rng_state",
+        "model_state_hash",
+        "optimizer_state_hash",
+        "rng_state_hash",
+        "training",
+        "optimizer",
+        "compatibility",
+        "complete_config_hash",
+        "epoch_plan_hashes",
+        "snapshot_history",
+    }
+)
+_CHECKPOINT_TRAINING_FIELDS = frozenset({"completed_epoch", "optimizer_step"})
+_CHECKPOINT_OPTIMIZER_FIELDS = frozenset(
+    {"treatment", "treatment_hash", "metadata", "metadata_hash"}
+)
+_CHECKPOINT_COMPATIBILITY_FIELDS = frozenset(
+    {
+        "optimizer_treatment_hash",
+        "common_initialization_hash",
+        "invariant_config_hash",
+        "dataset_sha256",
+        "seed",
+        "epoch_plan_rolling_hash",
+    }
+)
+_CHECKPOINT_SNAPSHOT_FIELDS = frozenset(
+    {"path", "record_count", "rolling_hash"}
+)
+
+
+def _require_nonnegative_int(field_name: str, value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative int")
+    return value
+
+
+def _require_sha256(field_name: str, value: object) -> str:
+    if type(value) is not str or len(value) != 64:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 hex string")
+    if value != value.lower() or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 hex string")
+    return value
+
+
+def _clone_optimizer_state(value: object) -> object:
+    if isinstance(value, Tensor):
+        return value.detach().to(device="cpu").clone()
+    if isinstance(value, Mapping):
+        return {
+            copy.deepcopy(key): _clone_optimizer_state(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_clone_optimizer_state(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_optimizer_state(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _optimizer_parameters(
+    optimizer: torch.optim.Optimizer,
+) -> list[nn.Parameter]:
+    return [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+
+
+def _validate_optimizer_owns_model(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    model_parameters = list(model.parameters())
+    optimizer_parameters = _optimizer_parameters(optimizer)
+    if len({id(value) for value in optimizer_parameters}) != len(
+        optimizer_parameters
+    ):
+        raise ValueError("diagnostic optimizer contains duplicate parameters")
+    if [id(value) for value in optimizer_parameters] != [
+        id(value) for value in model_parameters
+    ]:
+        raise ValueError(
+            "diagnostic optimizer parameters do not exactly match model parameters"
+        )
+
+
+def _validate_optimizer_matches_spec(
+    optimizer: torch.optim.Optimizer,
+    spec: OptimizerSpec,
+) -> dict[str, Any]:
+    canonical_spec = _canonical_optimizer_spec(spec)
+    expected_type: type[torch.optim.Optimizer]
+    if canonical_spec.name == "adagrad":
+        expected_type = torch.optim.Adagrad
+    else:
+        expected_type = torch.optim.AdamW
+    if type(optimizer) is not expected_type:
+        raise ValueError("optimizer metadata class does not match treatment")
+    if len(optimizer.param_groups) != 1:
+        raise ValueError("diagnostic optimizer must contain exactly one param group")
+
+    expected_values: dict[str, object] = {
+        "lr": canonical_spec.learning_rate,
+        "weight_decay": canonical_spec.weight_decay,
+        "eps": canonical_spec.eps,
+    }
+    if canonical_spec.name == "adagrad":
+        expected_values["initial_accumulator_value"] = (
+            canonical_spec.initial_accumulator_value
+        )
+    else:
+        expected_values["betas"] = canonical_spec.betas
+    for field_name, expected in expected_values.items():
+        if optimizer.defaults.get(field_name) != expected:
+            raise ValueError(
+                f"optimizer metadata defaults {field_name} does not match treatment"
+            )
+        if optimizer.param_groups[0].get(field_name) != expected:
+            raise ValueError(
+                f"optimizer metadata param group {field_name} "
+                "does not match treatment"
+            )
+    return optimizer_metadata(optimizer)
+
+
+def _snapshot_jsonl_metadata(path: Path) -> tuple[int, str]:
+    snapshot_path = Path(path)
+    data = snapshot_path.read_bytes()
+    if data and not data.endswith(b"\n"):
+        raise ValueError(
+            "snapshot history final record must include its terminating newline"
+        )
+    records = data.splitlines(keepends=True)
+    for index, record in enumerate(records, start=1):
+        record_bytes = record[:-1]
+        if not record_bytes.strip():
+            raise ValueError(f"snapshot history record {index} must not be blank")
+        try:
+            record_text = record_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"snapshot history record {index} must be valid UTF-8"
+            ) from error
+        try:
+            json.loads(record_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"snapshot history record {index} must contain valid JSON"
+            ) from error
+    return len(records), hashlib.sha256(data).hexdigest()
+
+
+def _validate_snapshot_history(
+    path: Path,
+    *,
+    expected_record_count: int,
+    expected_rolling_hash: str,
+) -> None:
+    record_count = _require_nonnegative_int(
+        "snapshot record count",
+        expected_record_count,
+    )
+    rolling_hash = _require_sha256(
+        "snapshot rolling hash",
+        expected_rolling_hash,
+    )
+    actual_record_count, actual_rolling_hash = _snapshot_jsonl_metadata(path)
+    if actual_record_count != record_count:
+        raise ValueError("snapshot history record count mismatch")
+    if actual_rolling_hash != rolling_hash:
+        raise ValueError("snapshot history rolling hash mismatch")
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    file_descriptor = os.open(Path(path).parent, flags)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _exclusive_torch_publish(path: Path, payload: object) -> None:
+    destination = Path(path)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    published = False
+    try:
+        torch.save(payload, temporary_path)
+        with temporary_path.open("rb") as temporary_file:
+            os.fsync(temporary_file.fileno())
+        os.link(temporary_path, destination)
+        published = True
+        _fsync_parent_directory(destination)
+    except BaseException:
+        if published:
+            try:
+                destination.unlink(missing_ok=True)
+                _fsync_parent_directory(destination)
+            except OSError:
+                pass
+        raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def save_diagnostic_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    optimizer_spec: OptimizerSpec,
+    completed_epoch: int,
+    optimizer_step: int,
+    rng_state: RngState,
+    common_initialization_hash: str,
+    invariant_config_hash: str,
+    complete_config_hash: str,
+    dataset_sha256: str,
+    seed: int,
+    epoch_hashes: Sequence[str],
+    epoch_plan_rolling_hash: str,
+    snapshot_jsonl_path: Path,
+    snapshot_record_count: int,
+    snapshot_rolling_hash: str,
+) -> None:
+    completed_epoch = _require_nonnegative_int(
+        "completed_epoch",
+        completed_epoch,
+    )
+    optimizer_step = _require_nonnegative_int("optimizer_step", optimizer_step)
+    if type(seed) is not int:
+        raise ValueError("seed must be an int")
+    common_initialization_hash = _require_sha256(
+        "common initialization hash",
+        common_initialization_hash,
+    )
+    invariant_config_hash = _require_sha256(
+        "invariant config hash",
+        invariant_config_hash,
+    )
+    complete_config_hash = _require_sha256(
+        "complete config hash",
+        complete_config_hash,
+    )
+    dataset_sha256 = _require_sha256("dataset SHA-256", dataset_sha256)
+    epoch_plan_rolling_hash = _require_sha256(
+        "epoch plan rolling hash",
+        epoch_plan_rolling_hash,
+    )
+    normalized_epoch_hashes = _normalize_epoch_hashes(epoch_hashes)
+    for epoch_hash in normalized_epoch_hashes:
+        _require_sha256("epoch plan hash", epoch_hash)
+    calculated_epoch_plan_hash = hash_json(normalized_epoch_hashes)
+    if calculated_epoch_plan_hash != epoch_plan_rolling_hash:
+        raise ValueError("epoch plan rolling hash mismatch")
+
+    snapshot_path = Path(snapshot_jsonl_path)
+    _validate_snapshot_history(
+        snapshot_path,
+        expected_record_count=snapshot_record_count,
+        expected_rolling_hash=snapshot_rolling_hash,
+    )
+    _validate_optimizer_owns_model(model, optimizer)
+    live_optimizer_metadata = _validate_optimizer_matches_spec(
+        optimizer,
+        optimizer_spec,
+    )
+
+    model_state = clone_cpu_state_dict(model)
+    optimizer_state = _clone_optimizer_state(optimizer.state_dict())
+    if not isinstance(optimizer_state, dict):
+        raise TypeError("optimizer state must be a dict")
+    cloned_rng_state = _clone_rng_state(rng_state)
+    treatment = optimizer_treatment_payload(optimizer_spec)
+    treatment_hash = optimizer_treatment_hash(optimizer_spec)
+    compatibility = {
+        "optimizer_treatment_hash": treatment_hash,
+        "common_initialization_hash": common_initialization_hash,
+        "invariant_config_hash": invariant_config_hash,
+        "dataset_sha256": dataset_sha256,
+        "seed": seed,
+        "epoch_plan_rolling_hash": calculated_epoch_plan_hash,
+    }
+    artifact = {
+        "schema_version": 1,
+        "artifact_kind": "rqvae_diagnostic_checkpoint",
+        "model_state": model_state,
+        "optimizer_state": optimizer_state,
+        "rng_state": cloned_rng_state,
+        "model_state_hash": hash_state_dict(model_state),
+        "optimizer_state_hash": hash_nested_state(optimizer_state),
+        "rng_state_hash": hash_rng_state(cloned_rng_state),
+        "training": {
+            "completed_epoch": completed_epoch,
+            "optimizer_step": optimizer_step,
+        },
+        "optimizer": {
+            "treatment": treatment,
+            "treatment_hash": treatment_hash,
+            "metadata": live_optimizer_metadata,
+            "metadata_hash": hash_json(live_optimizer_metadata),
+        },
+        "compatibility": compatibility,
+        "complete_config_hash": complete_config_hash,
+        "epoch_plan_hashes": normalized_epoch_hashes,
+        "snapshot_history": {
+            "path": str(snapshot_path),
+            "record_count": snapshot_record_count,
+            "rolling_hash": snapshot_rolling_hash,
+        },
+    }
+    _exclusive_torch_publish(Path(path), artifact)
+
+
+def _validate_checkpoint_model_target(
+    model: nn.Module,
+    model_state: Mapping[str, Tensor],
+) -> None:
+    current_state = clone_cpu_state_dict(model)
+    _validate_state_layouts(current_state, model_state)
+    layers = getattr(model, "layers", None)
+    if layers is None or any(
+        not hasattr(layer, "kmeans_initted") for layer in layers
+    ):
+        raise ValueError("model does not expose RQ-VAE kmeans flags")
+
+
+def _validate_optimizer_state_structure(
+    optimizer: torch.optim.Optimizer,
+    optimizer_state: Mapping[str, object],
+    spec: OptimizerSpec,
+) -> None:
+    if set(optimizer_state) != {"state", "param_groups"}:
+        raise ValueError("optimizer state has an invalid schema")
+    if not isinstance(optimizer_state["state"], Mapping):
+        raise ValueError("optimizer state entries must be a mapping")
+    if type(optimizer_state["param_groups"]) is not list:
+        raise ValueError("optimizer state param_groups must be a list")
+    stored_groups = optimizer_state["param_groups"]
+    if len(stored_groups) != len(optimizer.param_groups):
+        raise ValueError("optimizer state param group count mismatch")
+    for stored_group, live_group in zip(
+        stored_groups,
+        optimizer.state_dict()["param_groups"],
+        strict=True,
+    ):
+        if not isinstance(stored_group, Mapping):
+            raise ValueError("optimizer state param group must be a mapping")
+        if set(stored_group) != set(live_group):
+            raise ValueError("optimizer state param group schema mismatch")
+        if type(stored_group["params"]) is not list:
+            raise ValueError("optimizer state params must be a list")
+        if len(stored_group["params"]) != len(live_group["params"]):
+            raise ValueError("optimizer state parameter count mismatch")
+        if {
+            key: value for key, value in stored_group.items() if key != "params"
+        } != {
+            key: value for key, value in live_group.items() if key != "params"
+        }:
+            raise ValueError("optimizer state param group metadata mismatch")
+
+    dummy_parameters = nn.ParameterList(
+        [
+            nn.Parameter(
+                torch.empty(
+                    parameter.shape,
+                    dtype=parameter.dtype,
+                    device="cpu",
+                )
+            )
+            for parameter in _optimizer_parameters(optimizer)
+        ]
+    )
+    probe = build_diagnostic_optimizer(dummy_parameters, spec)
+    try:
+        probe.load_state_dict(copy.deepcopy(dict(optimizer_state)))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("optimizer state is incompatible with live optimizer") from error
+
+
+
+
+def _clone_runtime_value(value: object) -> object:
+    if isinstance(value, Tensor):
+        return value.detach().clone()
+    if isinstance(value, Mapping):
+        return {key: _clone_runtime_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_runtime_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_runtime_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _capture_optimizer_runtime_state(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    return {
+        "state": [
+            (parameter, _clone_runtime_value(value))
+            for parameter, value in optimizer.state.items()
+        ],
+        "param_groups": [
+            {
+                key: list(value) if key == "params" else copy.deepcopy(value)
+                for key, value in group.items()
+            }
+            for group in optimizer.param_groups
+        ],
+        "defaults": copy.deepcopy(optimizer.defaults),
+    }
+
+
+def _restore_optimizer_runtime_state(
+    optimizer: torch.optim.Optimizer,
+    snapshot: Mapping[str, Any],
+) -> None:
+    optimizer.state = defaultdict(
+        dict,
+        {
+            parameter: _clone_runtime_value(value)
+            for parameter, value in snapshot["state"]
+        },
+    )
+    optimizer.param_groups = [
+        {
+            key: list(value) if key == "params" else copy.deepcopy(value)
+            for key, value in group.items()
+        }
+        for group in snapshot["param_groups"]
+    ]
+    optimizer.defaults = copy.deepcopy(snapshot["defaults"])
+
+
+def _restore_model_state_direct(
+    model: nn.Module,
+    snapshot: Mapping[str, Tensor],
+) -> None:
+    current_state = model.state_dict()
+    _validate_state_layouts(current_state, snapshot)
+    with torch.no_grad():
+        for key, target in current_state.items():
+            target.copy_(snapshot[key].to(device=target.device))
+
+
+def _restore_rng_state_direct(state: RngState) -> None:
+    random.setstate(copy.deepcopy(state["python"]))
+    np.random.set_state(_clone_numpy_rng_state(state["numpy"]))
+    torch.set_rng_state(state["torch_cpu"].detach().to(device="cpu").clone())
+    if state["torch_cuda"]:
+        torch.cuda.set_rng_state_all(
+            [value.detach().to(device="cpu").clone() for value in state["torch_cuda"]]
+        )
+
+def load_diagnostic_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    optimizer_spec: OptimizerSpec,
+    expected_common_initialization_hash: str,
+    expected_invariant_config_hash: str,
+    expected_dataset_sha256: str,
+    expected_seed: int,
+    expected_epoch_plan_rolling_hash: str,
+    expected_snapshot_jsonl_path: Path,
+) -> dict[str, int]:
+    checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("diagnostic checkpoint must be a mapping")
+    _require_exact_fields(
+        checkpoint,
+        _CHECKPOINT_ARTIFACT_FIELDS,
+        "diagnostic checkpoint",
+    )
+    _require_equal("schema version", checkpoint["schema_version"], 1)
+    _require_equal(
+        "artifact kind",
+        checkpoint["artifact_kind"],
+        "rqvae_diagnostic_checkpoint",
+    )
+
+    expected_treatment_hash = optimizer_treatment_hash(optimizer_spec)
+    compatibility = checkpoint["compatibility"]
+    if not isinstance(compatibility, Mapping):
+        raise ValueError("checkpoint compatibility must be a mapping")
+    _require_exact_fields(
+        compatibility,
+        _CHECKPOINT_COMPATIBILITY_FIELDS,
+        "checkpoint compatibility",
+    )
+    required = {
+        "optimizer_treatment_hash": expected_treatment_hash,
+        "common_initialization_hash": expected_common_initialization_hash,
+        "invariant_config_hash": expected_invariant_config_hash,
+        "dataset_sha256": expected_dataset_sha256,
+        "seed": expected_seed,
+        "epoch_plan_rolling_hash": expected_epoch_plan_rolling_hash,
+    }
+    for key, expected in required.items():
+        if compatibility[key] != expected:
+            raise ValueError(f"incompatible diagnostic checkpoint {key}")
+    for field_name in (
+        "optimizer_treatment_hash",
+        "common_initialization_hash",
+        "invariant_config_hash",
+        "dataset_sha256",
+        "epoch_plan_rolling_hash",
+    ):
+        _require_sha256(field_name, compatibility[field_name])
+    if type(compatibility["seed"]) is not int:
+        raise ValueError("checkpoint compatibility seed must be an int")
+
+    training = checkpoint["training"]
+    if not isinstance(training, Mapping):
+        raise ValueError("checkpoint training metadata must be a mapping")
+    _require_exact_fields(
+        training,
+        _CHECKPOINT_TRAINING_FIELDS,
+        "checkpoint training metadata",
+    )
+    completed_epoch = _require_nonnegative_int(
+        "completed_epoch",
+        training["completed_epoch"],
+    )
+    optimizer_step = _require_nonnegative_int(
+        "optimizer_step",
+        training["optimizer_step"],
+    )
+    _require_sha256("complete config hash", checkpoint["complete_config_hash"])
+
+    if type(checkpoint["epoch_plan_hashes"]) is not list:
+        raise TypeError("checkpoint epoch_plan_hashes must be a list")
+    normalized_epoch_hashes = _normalize_epoch_hashes(
+        checkpoint["epoch_plan_hashes"]
+    )
+    for epoch_hash in normalized_epoch_hashes:
+        _require_sha256("epoch plan hash", epoch_hash)
+    calculated_epoch_plan_hash = hash_json(normalized_epoch_hashes)
+    if calculated_epoch_plan_hash != compatibility["epoch_plan_rolling_hash"]:
+        raise ValueError("checkpoint epoch plan rolling hash mismatch")
+
+    model_state = _clone_cpu_state_mapping(checkpoint["model_state"])
+    calculated_model_hash = hash_state_dict(model_state)
+    _require_equal(
+        "model state hash",
+        checkpoint["model_state_hash"],
+        calculated_model_hash,
+    )
+    _validate_checkpoint_model_target(model, model_state)
+
+    if not isinstance(checkpoint["optimizer_state"], Mapping):
+        raise ValueError("optimizer state must be a mapping")
+    optimizer_state = _clone_optimizer_state(checkpoint["optimizer_state"])
+    if not isinstance(optimizer_state, dict):
+        raise TypeError("optimizer state must be a dict")
+    calculated_optimizer_hash = hash_nested_state(optimizer_state)
+    _require_equal(
+        "optimizer state hash",
+        checkpoint["optimizer_state_hash"],
+        calculated_optimizer_hash,
+    )
+
+    calculated_rng_hash = hash_nested_state(checkpoint["rng_state"])
+    _require_equal(
+        "RNG state hash",
+        checkpoint["rng_state_hash"],
+        calculated_rng_hash,
+    )
+    try:
+        rng_state = _clone_rng_state(checkpoint["rng_state"])
+    except RuntimeError as error:
+        raise ValueError("checkpoint RNG state is invalid") from error
+
+    optimizer_payload = checkpoint["optimizer"]
+    if not isinstance(optimizer_payload, Mapping):
+        raise ValueError("checkpoint optimizer metadata must be a mapping")
+    _require_exact_fields(
+        optimizer_payload,
+        _CHECKPOINT_OPTIMIZER_FIELDS,
+        "checkpoint optimizer metadata",
+    )
+    expected_treatment = optimizer_treatment_payload(optimizer_spec)
+    _require_equal(
+        "optimizer treatment",
+        optimizer_payload["treatment"],
+        expected_treatment,
+    )
+    _require_equal(
+        "optimizer treatment hash",
+        optimizer_payload["treatment_hash"],
+        expected_treatment_hash,
+    )
+    if not isinstance(optimizer_payload["metadata"], Mapping):
+        raise ValueError("stored optimizer metadata must be a mapping")
+    stored_optimizer_metadata = dict(optimizer_payload["metadata"])
+    stored_optimizer_metadata_hash = hash_json(stored_optimizer_metadata)
+    _require_equal(
+        "optimizer metadata hash",
+        optimizer_payload["metadata_hash"],
+        stored_optimizer_metadata_hash,
+    )
+    _validate_optimizer_owns_model(model, optimizer)
+    live_optimizer_metadata = _validate_optimizer_matches_spec(
+        optimizer,
+        optimizer_spec,
+    )
+    _require_equal(
+        "optimizer metadata",
+        stored_optimizer_metadata,
+        live_optimizer_metadata,
+    )
+    _validate_optimizer_state_structure(
+        optimizer,
+        optimizer_state,
+        optimizer_spec,
+    )
+
+    snapshot_history = checkpoint["snapshot_history"]
+    if not isinstance(snapshot_history, Mapping):
+        raise ValueError("snapshot history must be a mapping")
+    _require_exact_fields(
+        snapshot_history,
+        _CHECKPOINT_SNAPSHOT_FIELDS,
+        "snapshot history",
+    )
+    expected_snapshot_path = Path(expected_snapshot_jsonl_path)
+    if snapshot_history["path"] != str(expected_snapshot_path):
+        raise ValueError("snapshot history path mismatch")
+    _validate_snapshot_history(
+        expected_snapshot_path,
+        expected_record_count=snapshot_history["record_count"],
+        expected_rolling_hash=snapshot_history["rolling_hash"],
+    )
+
+    live_model_state = clone_cpu_state_dict(model)
+    live_optimizer_state = _capture_optimizer_runtime_state(optimizer)
+    live_rng_state = capture_rng_state()
+    live_kmeans_flags = [layer.kmeans_initted for layer in model.layers]
+    try:
+        optimizer.load_state_dict(optimizer_state)
+        model.load_state_dict(model_state, strict=True)
+        for layer in model.layers:
+            layer.kmeans_initted = True
+        restore_rng_state(rng_state)
+    except BaseException:
+        _restore_model_state_direct(model, live_model_state)
+        _restore_optimizer_runtime_state(optimizer, live_optimizer_state)
+        for layer, flag in zip(model.layers, live_kmeans_flags, strict=True):
+            layer.kmeans_initted = flag
+        _restore_rng_state_direct(live_rng_state)
+        raise
+    return {
+        "start_epoch": completed_epoch + 1,
+        "optimizer_step": optimizer_step,
     }

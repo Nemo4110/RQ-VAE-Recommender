@@ -1,4 +1,6 @@
 import inspect
+import os
+import stat
 import random
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -7,6 +9,7 @@ from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 from types import MethodType
+from types import SimpleNamespace
 from typing import Any
 from typing import get_type_hints
 
@@ -1463,3 +1466,816 @@ def test_snapshot_rejects_non_post_kmeans_model_without_mutation() -> None:
         )
 
     assert _snapshot_observable_state(model, optimizer, generator) == before
+def _real_tiny_checkpoint_fixture(
+    tmp_path: Path,
+    spec: OptimizerSpec,
+) -> dict[str, Any]:
+    diagnostics.seed_all(20260701)
+    model = build_tiny_rqvae()
+    for layer in model.layers:
+        layer.kmeans_initted = True
+    optimizer = build_diagnostic_optimizer(model, spec)
+    inputs = torch.arange(64 * 8, dtype=torch.float32).reshape(64, 8) / 128
+    optimizer.zero_grad(set_to_none=True)
+    output = model(SimpleNamespace(x=inputs), gumbel_t=0.2)
+    output.loss.backward()
+    optimizer.step()
+
+    rng_state = diagnostics.capture_rng_state()
+    snapshot_path = tmp_path / f'{spec.name}-snapshots.jsonl'
+    snapshot_bytes = (
+        b'{"optimizer_step":1,"trigger":"optimizer_step:1"}\n'
+        b'{"completed_epoch":1,"note":"exact bytes"}\n'
+    )
+    snapshot_path.write_bytes(snapshot_bytes)
+    epoch_hashes = diagnostics.epoch_plan_hashes(1024, 20260701, 500)
+    epoch_plan_rolling_hash = hash_json(epoch_hashes)
+    checkpoint_path = tmp_path / f'{spec.name}-checkpoint.pt'
+    save_kwargs = {
+        'model': model,
+        'optimizer': optimizer,
+        'optimizer_spec': spec,
+        'completed_epoch': 7,
+        'optimizer_step': 13,
+        'rng_state': rng_state,
+        'common_initialization_hash': '1' * 64,
+        'invariant_config_hash': '2' * 64,
+        'complete_config_hash': '3' * 64,
+        'dataset_sha256': '4' * 64,
+        'seed': 20260701,
+        'epoch_hashes': epoch_hashes,
+        'epoch_plan_rolling_hash': epoch_plan_rolling_hash,
+        'snapshot_jsonl_path': snapshot_path,
+        'snapshot_record_count': 2,
+        'snapshot_rolling_hash': sha256(snapshot_bytes).hexdigest(),
+    }
+    diagnostics.save_diagnostic_checkpoint(checkpoint_path, **save_kwargs)
+    return {
+        'checkpoint_path': checkpoint_path,
+        'model': model,
+        'optimizer': optimizer,
+        'optimizer_spec': spec,
+        'rng_state': rng_state,
+        'snapshot_path': snapshot_path,
+        'snapshot_bytes': snapshot_bytes,
+        'epoch_hashes': epoch_hashes,
+        'epoch_plan_rolling_hash': epoch_plan_rolling_hash,
+        'save_kwargs': save_kwargs,
+    }
+
+
+def _checkpoint_load_kwargs(fixture: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'optimizer_spec': fixture['optimizer_spec'],
+        'expected_common_initialization_hash': '1' * 64,
+        'expected_invariant_config_hash': '2' * 64,
+        'expected_dataset_sha256': '4' * 64,
+        'expected_seed': 20260701,
+        'expected_epoch_plan_rolling_hash': fixture[
+            'epoch_plan_rolling_hash'
+        ],
+        'expected_snapshot_jsonl_path': fixture['snapshot_path'],
+    }
+
+
+def _fresh_checkpoint_target(
+    spec: OptimizerSpec,
+) -> tuple[RqVae, torch.optim.Optimizer]:
+    model = build_tiny_rqvae()
+    optimizer = build_diagnostic_optimizer(model, spec)
+    return model, optimizer
+
+
+def _assert_rejected_without_runtime_mutation(
+    fixture: Mapping[str, Any],
+    *,
+    checkpoint_path: Path,
+    model: RqVae,
+    optimizer: torch.optim.Optimizer,
+    expected_exception: type[Exception] = ValueError,
+    match: str,
+    load_overrides: Mapping[str, Any] | None = None,
+) -> None:
+    model_hash = diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(model)
+    )
+    optimizer_hash = diagnostics.hash_nested_state(optimizer.state_dict())
+    rng_hash = diagnostics.hash_rng_state(diagnostics.capture_rng_state())
+    kmeans_flags = [layer.kmeans_initted for layer in model.layers]
+    kwargs = _checkpoint_load_kwargs(fixture)
+    if load_overrides:
+        kwargs.update(load_overrides)
+
+    with pytest.raises(expected_exception, match=match):
+        diagnostics.load_diagnostic_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            **kwargs,
+        )
+
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(model)
+    ) == model_hash
+    assert diagnostics.hash_nested_state(optimizer.state_dict()) == optimizer_hash
+    assert diagnostics.hash_rng_state(diagnostics.capture_rng_state()) == rng_hash
+    assert [layer.kmeans_initted for layer in model.layers] == kmeans_flags
+
+
+def test_diagnostic_checkpoint_public_signatures_are_exact() -> None:
+    assert get_type_hints(diagnostics.save_diagnostic_checkpoint) == {
+        'path': Path,
+        'model': nn.Module,
+        'optimizer': torch.optim.Optimizer,
+        'optimizer_spec': OptimizerSpec,
+        'completed_epoch': int,
+        'optimizer_step': int,
+        'rng_state': diagnostics.RngState,
+        'common_initialization_hash': str,
+        'invariant_config_hash': str,
+        'complete_config_hash': str,
+        'dataset_sha256': str,
+        'seed': int,
+        'epoch_hashes': Sequence[str],
+        'epoch_plan_rolling_hash': str,
+        'snapshot_jsonl_path': Path,
+        'snapshot_record_count': int,
+        'snapshot_rolling_hash': str,
+        'return': type(None),
+    }
+    assert get_type_hints(diagnostics.load_diagnostic_checkpoint) == {
+        'path': Path,
+        'model': nn.Module,
+        'optimizer': torch.optim.Optimizer,
+        'optimizer_spec': OptimizerSpec,
+        'expected_common_initialization_hash': str,
+        'expected_invariant_config_hash': str,
+        'expected_dataset_sha256': str,
+        'expected_seed': int,
+        'expected_epoch_plan_rolling_hash': str,
+        'expected_snapshot_jsonl_path': Path,
+        'return': dict[str, int],
+    }
+    assert list(
+        inspect.signature(diagnostics.save_diagnostic_checkpoint).parameters
+    ) == [
+        'path',
+        'model',
+        'optimizer',
+        'optimizer_spec',
+        'completed_epoch',
+        'optimizer_step',
+        'rng_state',
+        'common_initialization_hash',
+        'invariant_config_hash',
+        'complete_config_hash',
+        'dataset_sha256',
+        'seed',
+        'epoch_hashes',
+        'epoch_plan_rolling_hash',
+        'snapshot_jsonl_path',
+        'snapshot_record_count',
+        'snapshot_rolling_hash',
+    ]
+    assert list(
+        inspect.signature(diagnostics.load_diagnostic_checkpoint).parameters
+    ) == [
+        'path',
+        'model',
+        'optimizer',
+        'optimizer_spec',
+        'expected_common_initialization_hash',
+        'expected_invariant_config_hash',
+        'expected_dataset_sha256',
+        'expected_seed',
+        'expected_epoch_plan_rolling_hash',
+        'expected_snapshot_jsonl_path',
+    ]
+
+
+@pytest.mark.parametrize(
+    'spec',
+    [OptimizerSpec.adagrad_default(), OptimizerSpec.adamw_author()],
+    ids=['adagrad', 'adamw'],
+)
+def test_real_tiny_checkpoint_round_trip_restores_all_state_and_schema(
+    tmp_path: Path,
+    spec: OptimizerSpec,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(tmp_path, spec)
+    checkpoint_path = fixture['checkpoint_path']
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    assert set(checkpoint) == {
+        'schema_version',
+        'artifact_kind',
+        'model_state',
+        'optimizer_state',
+        'rng_state',
+        'model_state_hash',
+        'optimizer_state_hash',
+        'rng_state_hash',
+        'training',
+        'optimizer',
+        'compatibility',
+        'complete_config_hash',
+        'epoch_plan_hashes',
+        'snapshot_history',
+    }
+    assert checkpoint['schema_version'] == 1
+    assert checkpoint['artifact_kind'] == 'rqvae_diagnostic_checkpoint'
+    assert checkpoint['training'] == {
+        'completed_epoch': 7,
+        'optimizer_step': 13,
+    }
+    assert checkpoint['optimizer'] == {
+        'treatment': optimizer_treatment_payload(spec),
+        'treatment_hash': optimizer_treatment_hash(spec),
+        'metadata': optimizer_metadata(fixture['optimizer']),
+        'metadata_hash': optimizer_metadata_hash(fixture['optimizer']),
+    }
+    assert checkpoint['compatibility'] == {
+        'optimizer_treatment_hash': optimizer_treatment_hash(spec),
+        'common_initialization_hash': '1' * 64,
+        'invariant_config_hash': '2' * 64,
+        'dataset_sha256': '4' * 64,
+        'seed': 20260701,
+        'epoch_plan_rolling_hash': fixture['epoch_plan_rolling_hash'],
+    }
+    assert checkpoint['complete_config_hash'] == '3' * 64
+    assert checkpoint['epoch_plan_hashes'] == fixture['epoch_hashes']
+    assert checkpoint['snapshot_history'] == {
+        'path': str(fixture['snapshot_path']),
+        'record_count': 2,
+        'rolling_hash': sha256(fixture['snapshot_bytes']).hexdigest(),
+    }
+    assert checkpoint['model_state_hash'] == diagnostics.hash_state_dict(
+        checkpoint['model_state']
+    )
+    assert checkpoint['optimizer_state_hash'] == diagnostics.hash_nested_state(
+        checkpoint['optimizer_state']
+    )
+    assert checkpoint['rng_state_hash'] == diagnostics.hash_rng_state(
+        checkpoint['rng_state']
+    )
+
+    target_model, target_optimizer = _fresh_checkpoint_target(spec)
+    random.random()
+    np.random.random()
+    torch.rand(5)
+    resumed = diagnostics.load_diagnostic_checkpoint(
+        checkpoint_path,
+        model=target_model,
+        optimizer=target_optimizer,
+        **_checkpoint_load_kwargs(fixture),
+    )
+
+    assert resumed == {'start_epoch': 8, 'optimizer_step': 13}
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(target_model)
+    ) == checkpoint['model_state_hash']
+    assert diagnostics.hash_nested_state(
+        target_optimizer.state_dict()
+    ) == checkpoint['optimizer_state_hash']
+    assert diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    ) == checkpoint['rng_state_hash']
+    assert all(layer.kmeans_initted for layer in target_model.layers)
+
+
+def test_checkpoint_publish_is_exclusive_and_cleans_temporary_file(
+    tmp_path: Path,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    checkpoint_path = fixture['checkpoint_path']
+    published_bytes = checkpoint_path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        diagnostics.save_diagnostic_checkpoint(
+            checkpoint_path,
+            **fixture['save_kwargs'],
+        )
+
+    assert checkpoint_path.read_bytes() == published_bytes
+    assert list(tmp_path.glob(f'.{checkpoint_path.name}.*.tmp')) == []
+
+
+def test_cross_treatment_checkpoint_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    model, optimizer = _fresh_checkpoint_target(OptimizerSpec.adamw_author())
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=fixture['checkpoint_path'],
+        model=model,
+        optimizer=optimizer,
+        match='optimizer_treatment_hash',
+        load_overrides={'optimizer_spec': OptimizerSpec.adamw_author()},
+    )
+
+
+@pytest.mark.parametrize(
+    ('field', 'load_overrides'),
+    [
+        (
+            'common_initialization_hash',
+            {'expected_common_initialization_hash': 'a' * 64},
+        ),
+        (
+            'invariant_config_hash',
+            {'expected_invariant_config_hash': 'b' * 64},
+        ),
+        ('dataset_sha256', {'expected_dataset_sha256': 'c' * 64}),
+        ('seed', {'expected_seed': 7}),
+        (
+            'epoch_plan_rolling_hash',
+            {'expected_epoch_plan_rolling_hash': 'd' * 64},
+        ),
+    ],
+)
+def test_checkpoint_compatibility_mismatch_rejects_before_mutation(
+    tmp_path: Path,
+    field: str,
+    load_overrides: dict[str, Any],
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    model, optimizer = _fresh_checkpoint_target(fixture['optimizer_spec'])
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=fixture['checkpoint_path'],
+        model=model,
+        optimizer=optimizer,
+        match=field,
+        load_overrides=load_overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    'tamper_kind',
+    ['model_state', 'optimizer_state', 'rng_state', 'optimizer_metadata'],
+)
+def test_checkpoint_tampered_state_or_metadata_rejects_before_mutation(
+    tmp_path: Path,
+    tamper_kind: str,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    checkpoint = torch.load(
+        fixture['checkpoint_path'],
+        map_location='cpu',
+        weights_only=False,
+    )
+    if tamper_kind == 'model_state':
+        first_key = next(iter(checkpoint['model_state']))
+        checkpoint['model_state'][first_key].add_(1)
+        match = 'model state hash'
+    elif tamper_kind == 'optimizer_state':
+        first_state = next(iter(checkpoint['optimizer_state']['state'].values()))
+        first_tensor = next(
+            value for value in first_state.values() if isinstance(value, Tensor)
+        )
+        first_tensor.add_(1)
+        match = 'optimizer state hash'
+    elif tamper_kind == 'rng_state':
+        checkpoint['rng_state']['torch_cpu'] = checkpoint['rng_state'][
+            'torch_cpu'
+        ].roll(1)
+        match = 'RNG state hash'
+    else:
+        checkpoint['optimizer']['metadata']['defaults']['lr'] = 0.25
+        checkpoint['optimizer']['metadata_hash'] = hash_json(
+            checkpoint['optimizer']['metadata']
+        )
+        match = 'optimizer metadata'
+    tampered_path = tmp_path / f'tampered-{tamper_kind}.pt'
+    torch.save(checkpoint, tampered_path)
+    model, optimizer = _fresh_checkpoint_target(fixture['optimizer_spec'])
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=tampered_path,
+        model=model,
+        optimizer=optimizer,
+        match=match,
+    )
+
+
+@pytest.mark.parametrize('tamper_kind', ['model_layout', 'optimizer_layout'])
+def test_checkpoint_rejects_rehashed_incompatible_state_before_load_calls(
+    tmp_path: Path,
+    tamper_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    checkpoint = torch.load(
+        fixture['checkpoint_path'],
+        map_location='cpu',
+        weights_only=False,
+    )
+    if tamper_kind == 'model_layout':
+        first_key = next(iter(checkpoint['model_state']))
+        checkpoint['model_state'][first_key] = checkpoint['model_state'][
+            first_key
+        ].reshape(-1)[:-1]
+        checkpoint['model_state_hash'] = diagnostics.hash_state_dict(
+            checkpoint['model_state']
+        )
+        match = 'model state shape'
+    else:
+        checkpoint['optimizer_state']['param_groups'][0]['params'].pop()
+        checkpoint['optimizer_state_hash'] = diagnostics.hash_nested_state(
+            checkpoint['optimizer_state']
+        )
+        match = 'optimizer state'
+    tampered_path = tmp_path / f'rehashed-{tamper_kind}.pt'
+    torch.save(checkpoint, tampered_path)
+    model, optimizer = _fresh_checkpoint_target(fixture['optimizer_spec'])
+    calls = {'model': 0, 'optimizer': 0}
+    original_model_load = model.load_state_dict
+    original_optimizer_load = optimizer.load_state_dict
+
+    def tracked_model_load(*args, **kwargs):
+        calls['model'] += 1
+        return original_model_load(*args, **kwargs)
+
+    def tracked_optimizer_load(*args, **kwargs):
+        calls['optimizer'] += 1
+        return original_optimizer_load(*args, **kwargs)
+
+    monkeypatch.setattr(model, 'load_state_dict', tracked_model_load)
+    monkeypatch.setattr(optimizer, 'load_state_dict', tracked_optimizer_load)
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=tampered_path,
+        model=model,
+        optimizer=optimizer,
+        match=match,
+    )
+    assert calls == {'model': 0, 'optimizer': 0}
+
+
+@pytest.mark.parametrize(
+    ('history_mutation', 'match'),
+    [
+        ('append_tail', 'record count'),
+        ('change_record', 'rolling hash'),
+        ('remove_final_newline', 'terminating newline'),
+    ],
+)
+def test_checkpoint_requires_exact_newline_inclusive_jsonl_history(
+    tmp_path: Path,
+    history_mutation: str,
+    match: str,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    if history_mutation == 'append_tail':
+        fixture['snapshot_path'].write_bytes(
+            fixture['snapshot_bytes'] + b'{"unexpected":"tail"}\n'
+        )
+    elif history_mutation == 'change_record':
+        fixture['snapshot_path'].write_bytes(
+            fixture['snapshot_bytes'].replace(b'exact bytes', b'other bytes')
+        )
+    else:
+        fixture['snapshot_path'].write_bytes(fixture['snapshot_bytes'][:-1])
+    model, optimizer = _fresh_checkpoint_target(fixture['optimizer_spec'])
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=fixture['checkpoint_path'],
+        model=model,
+        optimizer=optimizer,
+        match=match,
+    )
+
+
+def test_checkpoint_rejects_different_jsonl_path_before_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    other_path = tmp_path / 'other.jsonl'
+    other_path.write_bytes(fixture['snapshot_bytes'])
+    model, optimizer = _fresh_checkpoint_target(fixture['optimizer_spec'])
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=fixture['checkpoint_path'],
+        model=model,
+        optimizer=optimizer,
+        match='snapshot history path',
+        load_overrides={'expected_snapshot_jsonl_path': other_path},
+    )
+
+
+@pytest.mark.parametrize(
+    ('override', 'match'),
+    [
+        ({'snapshot_record_count': 1}, 'record count'),
+        ({'snapshot_rolling_hash': 'f' * 64}, 'rolling hash'),
+    ],
+)
+def test_checkpoint_save_rejects_inconsistent_jsonl_metadata(
+    tmp_path: Path,
+    override: dict[str, Any],
+    match: str,
+) -> None:
+    diagnostics.seed_all(20260701)
+    model = build_tiny_rqvae()
+    for layer in model.layers:
+        layer.kmeans_initted = True
+    spec = OptimizerSpec.adagrad_default()
+    optimizer = build_diagnostic_optimizer(model, spec)
+    snapshot_path = tmp_path / 'snapshots.jsonl'
+    snapshot_bytes = b'{"record":1}\n{"record":2}\n'
+    snapshot_path.write_bytes(snapshot_bytes)
+    epoch_hashes = diagnostics.epoch_plan_hashes(1024, 20260701, 500)
+    checkpoint_path = tmp_path / 'invalid-checkpoint.pt'
+    kwargs = {
+        'model': model,
+        'optimizer': optimizer,
+        'optimizer_spec': spec,
+        'completed_epoch': 0,
+        'optimizer_step': 0,
+        'rng_state': diagnostics.capture_rng_state(),
+        'common_initialization_hash': '1' * 64,
+        'invariant_config_hash': '2' * 64,
+        'complete_config_hash': '3' * 64,
+        'dataset_sha256': '4' * 64,
+        'seed': 20260701,
+        'epoch_hashes': epoch_hashes,
+        'epoch_plan_rolling_hash': hash_json(epoch_hashes),
+        'snapshot_jsonl_path': snapshot_path,
+        'snapshot_record_count': 2,
+        'snapshot_rolling_hash': sha256(snapshot_bytes).hexdigest(),
+        **override,
+    }
+
+    with pytest.raises(ValueError, match=match):
+        diagnostics.save_diagnostic_checkpoint(checkpoint_path, **kwargs)
+    assert not checkpoint_path.exists()
+
+
+
+@pytest.mark.parametrize(
+    ("snapshot_bytes", "match"),
+    [
+        (b'{"record":1}\n\n', "blank"),
+        (b'{"record":1}\nnot-json\n', "valid JSON"),
+    ],
+)
+def test_checkpoint_save_rejects_self_consistent_invalid_jsonl_records(
+    tmp_path: Path,
+    snapshot_bytes: bytes,
+    match: str,
+) -> None:
+    model = build_tiny_rqvae()
+    for layer in model.layers:
+        layer.kmeans_initted = True
+    spec = OptimizerSpec.adagrad_default()
+    optimizer = build_diagnostic_optimizer(model, spec)
+    snapshot_path = tmp_path / "invalid-records.jsonl"
+    snapshot_path.write_bytes(snapshot_bytes)
+    epoch_hashes = diagnostics.epoch_plan_hashes(1024, 20260701, 500)
+    checkpoint_path = tmp_path / "invalid-records-checkpoint.pt"
+
+    with pytest.raises(ValueError, match=match):
+        diagnostics.save_diagnostic_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            optimizer_spec=spec,
+            completed_epoch=0,
+            optimizer_step=0,
+            rng_state=diagnostics.capture_rng_state(),
+            common_initialization_hash="1" * 64,
+            invariant_config_hash="2" * 64,
+            complete_config_hash="3" * 64,
+            dataset_sha256="4" * 64,
+            seed=20260701,
+            epoch_hashes=epoch_hashes,
+            epoch_plan_rolling_hash=hash_json(epoch_hashes),
+            snapshot_jsonl_path=snapshot_path,
+            snapshot_record_count=snapshot_bytes.count(b"\n"),
+            snapshot_rolling_hash=sha256(snapshot_bytes).hexdigest(),
+        )
+    assert not checkpoint_path.exists()
+
+
+def test_checkpoint_load_rejects_self_consistent_malformed_jsonl_before_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    malformed_bytes = b'{"record":1}\nnot-json\n'
+    fixture["snapshot_path"].write_bytes(malformed_bytes)
+    checkpoint = torch.load(
+        fixture["checkpoint_path"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    checkpoint["snapshot_history"]["record_count"] = 2
+    checkpoint["snapshot_history"]["rolling_hash"] = sha256(
+        malformed_bytes
+    ).hexdigest()
+    tampered_path = tmp_path / "self-consistent-malformed-checkpoint.pt"
+    torch.save(checkpoint, tampered_path)
+    model, optimizer = _fresh_checkpoint_target(fixture["optimizer_spec"])
+
+    _assert_rejected_without_runtime_mutation(
+        fixture,
+        checkpoint_path=tampered_path,
+        model=model,
+        optimizer=optimizer,
+        match="valid JSON",
+    )
+
+
+
+def test_exclusive_checkpoint_publish_fsyncs_file_then_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "durable-checkpoint.pt"
+    events: list[str] = []
+    real_save = diagnostics.torch.save
+    real_link = diagnostics.os.link
+    real_fsync = diagnostics.os.fsync
+
+    def tracked_save(payload: object, path: Path) -> None:
+        events.append("save")
+        real_save(payload, path)
+
+    def tracked_fsync(file_descriptor: int) -> None:
+        mode = os.fstat(file_descriptor).st_mode
+        events.append("fsync_directory" if stat.S_ISDIR(mode) else "fsync_file")
+        real_fsync(file_descriptor)
+
+    def tracked_link(source: Path, target: Path) -> None:
+        events.append("link")
+        real_link(source, target)
+
+    monkeypatch.setattr(diagnostics.torch, "save", tracked_save)
+    monkeypatch.setattr(diagnostics.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(diagnostics.os, "link", tracked_link)
+
+    diagnostics._exclusive_torch_publish(destination, {"value": 1})
+
+    assert events == ["save", "fsync_file", "link", "fsync_directory"]
+    assert destination.is_file()
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure_stage", ["file_fsync", "directory_fsync"])
+def test_exclusive_checkpoint_publish_cleans_all_outputs_on_fsync_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    destination = tmp_path / f"failed-{failure_stage}.pt"
+    real_fsync = diagnostics.os.fsync
+    call_count = 0
+
+    def failing_fsync(file_descriptor: int) -> None:
+        nonlocal call_count
+        call_count += 1
+        if failure_stage == "file_fsync" and call_count == 1:
+            raise OSError("file fsync failure")
+        if failure_stage == "directory_fsync" and call_count == 2:
+            raise OSError("directory fsync failure")
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(diagnostics.os, "fsync", failing_fsync)
+
+    with pytest.raises(OSError, match="fsync failure"):
+        diagnostics._exclusive_torch_publish(destination, {"value": 1})
+
+    assert not destination.exists()
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["optimizer_load", "model_post_hook", "rng_restore"],
+)
+def test_checkpoint_load_rolls_back_every_runtime_state_after_mutation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    fixture = _real_tiny_checkpoint_fixture(
+        tmp_path,
+        OptimizerSpec.adagrad_default(),
+    )
+    model, optimizer = _fresh_checkpoint_target(fixture["optimizer_spec"])
+    original_model_state = diagnostics.clone_cpu_state_dict(model)
+    original_model_hash = diagnostics.hash_state_dict(original_model_state)
+    original_optimizer_state = diagnostics._clone_optimizer_state(
+        optimizer.state_dict()
+    )
+    original_optimizer_hash = diagnostics.hash_nested_state(
+        original_optimizer_state
+    )
+    original_rng_state = diagnostics.capture_rng_state()
+    original_rng_hash = diagnostics.hash_rng_state(original_rng_state)
+    original_kmeans_flags = [layer.kmeans_initted for layer in model.layers]
+    hook_handle = None
+    calls = 0
+
+    if failure_stage == "optimizer_load":
+        original_load = optimizer.load_state_dict
+
+        def fail_after_optimizer_mutation(state: Mapping[str, Any]) -> None:
+            nonlocal calls
+            original_load(state)
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("optimizer load failure after mutation")
+
+        monkeypatch.setattr(
+            optimizer,
+            "load_state_dict",
+            fail_after_optimizer_mutation,
+        )
+    elif failure_stage == "model_post_hook":
+
+        def fail_first_model_post_hook(
+            module: nn.Module,
+            incompatible_keys: object,
+        ) -> None:
+            del incompatible_keys
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                for layer in module.layers:
+                    layer.kmeans_initted = True
+                raise RuntimeError("model post-hook failure after mutation")
+
+        hook_handle = model.register_load_state_dict_post_hook(
+            fail_first_model_post_hook
+        )
+    else:
+        original_restore = diagnostics.restore_rng_state
+
+        def fail_after_rng_mutation(state: diagnostics.RngState) -> None:
+            nonlocal calls
+            original_restore(state)
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("RNG restore failure after mutation")
+
+        monkeypatch.setattr(
+            diagnostics,
+            "restore_rng_state",
+            fail_after_rng_mutation,
+        )
+
+    with pytest.raises(RuntimeError, match="failure after mutation"):
+        diagnostics.load_diagnostic_checkpoint(
+            fixture["checkpoint_path"],
+            model=model,
+            optimizer=optimizer,
+            **_checkpoint_load_kwargs(fixture),
+        )
+
+    if hook_handle is not None:
+        hook_handle.remove()
+    assert calls == 1
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(model)
+    ) == original_model_hash
+    assert diagnostics.hash_nested_state(
+        optimizer.state_dict()
+    ) == original_optimizer_hash
+    assert diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    ) == original_rng_hash
+    assert [layer.kmeans_initted for layer in model.layers] == (
+        original_kmeans_flags
+    )
