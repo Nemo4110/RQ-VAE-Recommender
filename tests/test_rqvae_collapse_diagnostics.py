@@ -1,13 +1,20 @@
+import inspect
 import random
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
+from typing import get_type_hints
 
 import numpy as np
 import pytest
 import torch
+from torch import Tensor
 from torch import nn
+from torch.utils.data import Dataset
 from torch.utils.data import TensorDataset
 
 import rqvae_collapse_diagnostics as diagnostics
@@ -577,12 +584,76 @@ def test_epoch_plan_rejects_nonpositive_dimensions(call, match: str) -> None:
         call()
 
 
+def test_common_initialization_public_signatures_are_exact() -> None:
+    assert get_type_hints(diagnostics.load_items_by_index) == {
+        "dataset": Dataset,
+        "indices": Tensor,
+        "return": Tensor,
+    }
+    assert get_type_hints(diagnostics.capture_rng_state) == {
+        "return": diagnostics.RngState,
+    }
+    assert get_type_hints(diagnostics.restore_rng_state) == {
+        "state": diagnostics.RngState,
+        "return": type(None),
+    }
+    assert get_type_hints(diagnostics.hash_rng_state) == {
+        "state": diagnostics.RngState,
+        "return": str,
+    }
+    assert get_type_hints(diagnostics.save_common_initialization) == {
+        "path": Path,
+        "initial_model_state": Mapping[str, Tensor],
+        "post_kmeans_model_state": Mapping[str, Tensor],
+        "rng_before_model_initialization": diagnostics.RngState,
+        "rng_at_training_start": diagnostics.RngState,
+        "initial_batch_indices": Tensor,
+        "initial_batch_inputs": Tensor,
+        "initial_batch_used_code_counts": Sequence[int],
+        "dataset_sha256": str,
+        "dataset_item_count": int,
+        "seed": int,
+        "initialization_config_payload": Mapping[str, Any],
+        "epoch_hashes": Sequence[str],
+        "epoch_plan_rolling_hash": str,
+        "return": dict[str, Any],
+    }
+    assert get_type_hints(diagnostics.load_common_initialization) == {
+        "path": Path,
+        "model": nn.Module,
+        "expected_dataset_sha256": str,
+        "expected_dataset_item_count": int,
+        "expected_seed": int,
+        "expected_initialization_config_hash": str,
+        "expected_epoch_plan_rolling_hash": str,
+        "return": dict[str, Any],
+    }
+    assert list(
+        inspect.signature(diagnostics.save_common_initialization).parameters
+    ) == [
+        "path",
+        "initial_model_state",
+        "post_kmeans_model_state",
+        "rng_before_model_initialization",
+        "rng_at_training_start",
+        "initial_batch_indices",
+        "initial_batch_inputs",
+        "initial_batch_used_code_counts",
+        "dataset_sha256",
+        "dataset_item_count",
+        "seed",
+        "initialization_config_payload",
+        "epoch_hashes",
+        "epoch_plan_rolling_hash",
+    ]
+
+
 def test_common_initialization_round_trip_validation_and_exclusive_publish(
     tmp_path: Path,
 ) -> None:
     seed = 20260701
     dataset_sha256 = "a" * 64
-    dataset_item_count = 12101
+    dataset_item_count = 1024
     initialization_payload = initialization_config(
         diagnostic_config(
             dataset_sha256=dataset_sha256,
@@ -597,7 +668,11 @@ def test_common_initialization_round_trip_validation_and_exclusive_publish(
     rng_before_model_initialization = diagnostics.capture_rng_state()
     model = build_tiny_rqvae()
     initial_model_state = diagnostics.clone_cpu_state_dict(model)
-    initial_batch_indices = torch.arange(1024, dtype=torch.long)
+    initial_batch_indices = diagnostics.epoch_permutation(
+        dataset_item_count,
+        seed,
+        1,
+    )[:1024]
     initial_batch_inputs = (
         torch.arange(1024 * 8, dtype=torch.float32).reshape(1024, 8) / 1024
     )
@@ -729,6 +804,76 @@ def test_common_initialization_round_trip_validation_and_exclusive_publish(
         expected_compatibility
     )
 
+    normalized_sequence_path = tmp_path / "normalized_sequences.pt"
+    normalized_sequence_artifact = diagnostics.save_common_initialization(
+        normalized_sequence_path,
+        **{
+            **save_kwargs,
+            "initial_batch_used_code_counts": tuple(
+                initial_batch_used_code_counts
+            ),
+            "epoch_hashes": tuple(epoch_hashes),
+        },
+    )
+    assert type(
+        normalized_sequence_artifact["initial_batch"]["used_code_counts"]
+    ) is list
+    assert type(normalized_sequence_artifact["epoch_plan_hashes"]) is list
+    normalized_sequence_path.unlink()
+
+    invalid_config_payloads = [
+        [],
+        {
+            key: value
+            for key, value in initialization_payload.items()
+            if key != "seed"
+        },
+        {**initialization_payload, "unexpected": True},
+        {**initialization_payload, "dataset_sha256": "b" * 64},
+        {**initialization_payload, "dataset_item_count": 2048},
+        {**initialization_payload, "seed": seed + 1},
+    ]
+    for index, invalid_payload in enumerate(invalid_config_payloads):
+        with pytest.raises(
+            (TypeError, ValueError),
+            match="initialization config",
+        ):
+            diagnostics.save_common_initialization(
+                tmp_path / f"invalid_config_{index}.pt",
+                **{
+                    **save_kwargs,
+                    "initialization_config_payload": invalid_payload,
+                },
+            )
+
+    invalid_batches = [
+        {
+            "initial_batch_indices": initial_batch_indices.tolist(),
+        },
+        {
+            "initial_batch_indices": initial_batch_indices.to(torch.int32),
+        },
+        {
+            "initial_batch_indices": initial_batch_indices[:1023],
+            "initial_batch_inputs": initial_batch_inputs[:1023],
+        },
+        {
+            "initial_batch_indices": initial_batch_indices.roll(1),
+        },
+        {
+            "initial_batch_inputs": initial_batch_inputs[:1023],
+        },
+    ]
+    for index, overrides in enumerate(invalid_batches):
+        with pytest.raises(
+            (TypeError, ValueError),
+            match="initial batch",
+        ):
+            diagnostics.save_common_initialization(
+                tmp_path / f"invalid_batch_{index}.pt",
+                **{**save_kwargs, **overrides},
+            )
+
     forged_epoch_hashes = list(epoch_hashes)
     forged_epoch_hashes[0] = "0" * 64
     forged_rolling_hash = hash_json(forged_epoch_hashes)
@@ -780,6 +925,143 @@ def test_common_initialization_round_trip_validation_and_exclusive_publish(
     assert diagnostics.hash_rng_state(diagnostics.capture_rng_state()) == artifact[
         "rng_at_training_start_hash"
     ]
+
+    def assert_stored_artifact_rejected(
+        candidate: dict[str, Any],
+        *,
+        filename: str,
+        error_type: type[Exception],
+        match: str,
+        expected_config_hash: str,
+    ) -> None:
+        candidate_path = tmp_path / filename
+        torch.save(candidate, candidate_path)
+        diagnostics.restore_rng_state(rng_before_model_initialization)
+        candidate_model = build_tiny_rqvae()
+        candidate_model_hash = diagnostics.hash_state_dict(
+            diagnostics.clone_cpu_state_dict(candidate_model)
+        )
+        candidate_rng_hash = diagnostics.hash_rng_state(
+            diagnostics.capture_rng_state()
+        )
+        with pytest.raises(error_type, match=match):
+            diagnostics.load_common_initialization(
+                candidate_path,
+                model=candidate_model,
+                expected_dataset_sha256=dataset_sha256,
+                expected_dataset_item_count=dataset_item_count,
+                expected_seed=seed,
+                expected_initialization_config_hash=expected_config_hash,
+                expected_epoch_plan_rolling_hash=epoch_plan_rolling_hash,
+            )
+        assert diagnostics.hash_state_dict(
+            diagnostics.clone_cpu_state_dict(candidate_model)
+        ) == candidate_model_hash
+        assert diagnostics.hash_rng_state(
+            diagnostics.capture_rng_state()
+        ) == candidate_rng_hash
+
+    tuple_epoch_artifact = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    tuple_epoch_artifact["epoch_plan_hashes"] = tuple(epoch_hashes)
+    assert_stored_artifact_rejected(
+        tuple_epoch_artifact,
+        filename="tuple_epoch_hashes.pt",
+        error_type=TypeError,
+        match="epoch_plan_hashes.*list",
+        expected_config_hash=artifact["initialization_config_hash"],
+    )
+
+    tensor_usage_artifact = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    tensor_usage_artifact["initial_batch"]["used_code_counts"] = torch.tensor(
+        initial_batch_used_code_counts
+    )
+    assert_stored_artifact_rejected(
+        tensor_usage_artifact,
+        filename="tensor_usage.pt",
+        error_type=TypeError,
+        match="used_code_counts.*list",
+        expected_config_hash=artifact["initialization_config_hash"],
+    )
+
+    int32_indices_artifact = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    int32_indices = initial_batch_indices.to(torch.int32)
+    int32_indices_hash = diagnostics.hash_tensor(int32_indices)
+    int32_indices_artifact["initial_batch"]["indices"] = int32_indices
+    int32_indices_artifact["initial_batch"]["indices_hash"] = int32_indices_hash
+    int32_indices_artifact["compatibility"][
+        "initial_batch_indices_hash"
+    ] = int32_indices_hash
+    int32_indices_artifact["common_initialization_hash"] = hash_json(
+        int32_indices_artifact["compatibility"]
+    )
+    assert_stored_artifact_rejected(
+        int32_indices_artifact,
+        filename="int32_indices.pt",
+        error_type=ValueError,
+        match="initial batch.*long",
+        expected_config_hash=artifact["initialization_config_hash"],
+    )
+
+    wrong_indices_artifact = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    wrong_indices = initial_batch_indices.roll(1)
+    wrong_indices_hash = diagnostics.hash_tensor(wrong_indices)
+    wrong_indices_artifact["initial_batch"]["indices"] = wrong_indices
+    wrong_indices_artifact["initial_batch"]["indices_hash"] = wrong_indices_hash
+    wrong_indices_artifact["compatibility"][
+        "initial_batch_indices_hash"
+    ] = wrong_indices_hash
+    wrong_indices_artifact["common_initialization_hash"] = hash_json(
+        wrong_indices_artifact["compatibility"]
+    )
+    assert_stored_artifact_rejected(
+        wrong_indices_artifact,
+        filename="wrong_indices.pt",
+        error_type=ValueError,
+        match="initial batch.*epoch permutation",
+        expected_config_hash=artifact["initialization_config_hash"],
+    )
+
+    mismatched_config_artifact = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    mismatched_config_artifact["initialization_config"]["seed"] = seed + 1
+    mismatched_config_hash = hash_json(
+        mismatched_config_artifact["initialization_config"]
+    )
+    mismatched_config_artifact[
+        "initialization_config_hash"
+    ] = mismatched_config_hash
+    mismatched_config_artifact["compatibility"][
+        "initialization_config_hash"
+    ] = mismatched_config_hash
+    mismatched_config_artifact["common_initialization_hash"] = hash_json(
+        mismatched_config_artifact["compatibility"]
+    )
+    assert_stored_artifact_rejected(
+        mismatched_config_artifact,
+        filename="mismatched_config.pt",
+        error_type=ValueError,
+        match="initialization config.*seed",
+        expected_config_hash=mismatched_config_hash,
+    )
 
     forged = torch.load(path, map_location="cpu", weights_only=False)
     forged["epoch_plan_hashes"] = forged_epoch_hashes

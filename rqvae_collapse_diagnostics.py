@@ -8,6 +8,7 @@ import random
 import struct
 import tempfile
 from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,9 @@ from typing import TypedDict
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch import nn
+from torch.utils.data import Dataset
 
 
 INITIALIZATION_CONFIG_FIELDS = frozenset(
@@ -444,8 +447,10 @@ def _extract_item_tensor(value: object) -> torch.Tensor:
     raise TypeError("dataset items must be tensors or expose a tensor-valued x field")
 
 
-def load_items_by_index(dataset: object, indices: object) -> torch.Tensor:
-    index_tensor = torch.as_tensor(indices, dtype=torch.long, device="cpu")
+def load_items_by_index(dataset: Dataset, indices: Tensor) -> Tensor:
+    if not isinstance(indices, Tensor):
+        raise TypeError("indices must be a torch.Tensor")
+    index_tensor = indices.detach().to(dtype=torch.long, device="cpu")
     if index_tensor.ndim != 1:
         raise ValueError("indices must be one-dimensional")
     try:
@@ -557,7 +562,7 @@ def _validate_rng_state(state: Mapping[str, object]) -> None:
             probe.set_state(cuda_state.detach().to(device="cpu"))
 
 
-def restore_rng_state(state: Mapping[str, object]) -> None:
+def restore_rng_state(state: RngState) -> None:
     _validate_rng_state(state)
     random.setstate(copy.deepcopy(state["python"]))
     np.random.set_state(_clone_numpy_rng_state(state["numpy"]))
@@ -571,7 +576,7 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
         )
 
 
-def hash_rng_state(state: Mapping[str, object]) -> str:
+def hash_rng_state(state: RngState) -> str:
     _validate_rng_state(state)
     return hash_nested_state(state)
 
@@ -647,9 +652,12 @@ def _validate_state_layouts(
             raise ValueError(f"model state dtype changed for {key}")
 
 
-def _normalize_epoch_hashes(epoch_hashes: object) -> list[str]:
-    if not isinstance(epoch_hashes, (list, tuple)):
-        raise TypeError("epoch_hashes must be a list or tuple")
+def _normalize_epoch_hashes(epoch_hashes: Sequence[str]) -> list[str]:
+    if isinstance(epoch_hashes, (str, bytes)) or not isinstance(
+        epoch_hashes,
+        Sequence,
+    ):
+        raise TypeError("epoch_hashes must be a sequence")
     normalized = list(epoch_hashes)
     if len(normalized) != 500:
         raise ValueError("epoch_hashes must contain exactly 500 hashes")
@@ -661,15 +669,85 @@ def _normalize_epoch_hashes(epoch_hashes: object) -> list[str]:
     return normalized
 
 
-def _normalize_used_code_counts(value: object) -> list[int]:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().to(device="cpu").tolist()
-    if not isinstance(value, (list, tuple)):
-        raise TypeError("initial_batch_used_code_counts must be a list or tuple")
+def _normalize_used_code_counts(value: Sequence[int]) -> list[int]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(
+            "initial_batch_used_code_counts must be a sequence of ints"
+        )
     counts = list(value)
     if any(type(count) is not int or count < 0 for count in counts):
         raise ValueError("initial batch used code counts must be nonnegative ints")
     return counts
+
+
+def _validated_initialization_config_payload(
+    payload: Mapping[str, Any],
+    *,
+    dataset_sha256: str,
+    dataset_item_count: int,
+    seed: int,
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise TypeError("initialization config payload must be a mapping")
+    if set(payload) != INITIALIZATION_CONFIG_FIELDS:
+        raise ValueError(
+            "initialization config payload must contain exactly the fixed fields"
+        )
+    normalized = copy.deepcopy(dict(payload))
+    required_matches = {
+        "dataset_sha256": dataset_sha256,
+        "dataset_item_count": dataset_item_count,
+        "seed": seed,
+    }
+    for field_name, expected in required_matches.items():
+        actual = normalized[field_name]
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                f"initialization config {field_name} does not agree "
+                "with common initialization metadata"
+            )
+    return normalized
+
+
+def _validated_initial_batch_indices(
+    indices: Tensor,
+    *,
+    dataset_item_count: int,
+    seed: int,
+) -> Tensor:
+    if not isinstance(indices, Tensor):
+        raise TypeError("initial batch indices must be a torch.Tensor")
+    value = indices.detach().to(device="cpu")
+    if value.ndim != 1:
+        raise ValueError("initial batch indices must be one-dimensional")
+    if value.dtype is not torch.long:
+        raise ValueError("initial batch indices must use torch.long")
+    if value.numel() != 1024:
+        raise ValueError("initial batch indices must contain exactly 1024 values")
+    expected = epoch_permutation(dataset_item_count, seed, 1)[:1024]
+    if expected.numel() != 1024:
+        raise ValueError(
+            "initial batch requires a dataset with at least 1024 items"
+        )
+    if not torch.equal(value, expected):
+        raise ValueError(
+            "initial batch indices must equal the epoch permutation prefix"
+        )
+    return value.contiguous().clone()
+
+
+def _validated_initial_batch_inputs(
+    inputs: Tensor,
+    *,
+    indices: Tensor,
+) -> Tensor:
+    if not isinstance(inputs, Tensor):
+        raise TypeError("initial batch inputs must be a torch.Tensor")
+    if inputs.ndim == 0 or inputs.shape[0] != 1024:
+        raise ValueError("initial batch inputs must contain exactly 1024 rows")
+    if inputs.shape[0] != indices.numel():
+        raise ValueError("initial batch input rows must match index rows")
+    return inputs.detach().to(device="cpu").clone()
 
 
 def _compatibility_payload(
@@ -704,20 +782,20 @@ def _compatibility_payload(
 def save_common_initialization(
     path: Path,
     *,
-    initial_model_state,
-    post_kmeans_model_state,
-    rng_before_model_initialization,
-    rng_at_training_start,
-    initial_batch_indices,
-    initial_batch_inputs,
-    initial_batch_used_code_counts,
-    dataset_sha256,
-    dataset_item_count,
-    seed,
-    initialization_config_payload,
-    epoch_hashes,
-    epoch_plan_rolling_hash,
-) -> dict:
+    initial_model_state: Mapping[str, Tensor],
+    post_kmeans_model_state: Mapping[str, Tensor],
+    rng_before_model_initialization: RngState,
+    rng_at_training_start: RngState,
+    initial_batch_indices: Tensor,
+    initial_batch_inputs: Tensor,
+    initial_batch_used_code_counts: Sequence[int],
+    dataset_sha256: str,
+    dataset_item_count: int,
+    seed: int,
+    initialization_config_payload: Mapping[str, Any],
+    epoch_hashes: Sequence[str],
+    epoch_plan_rolling_hash: str,
+) -> dict[str, Any]:
     destination = Path(path)
     if type(dataset_sha256) is not str:
         raise TypeError("dataset_sha256 must be a string")
@@ -727,22 +805,27 @@ def save_common_initialization(
     )
     if type(seed) is not int:
         raise ValueError("seed must be an int")
-    if not isinstance(initial_batch_inputs, torch.Tensor):
-        raise TypeError("initial_batch_inputs must be a tensor")
+    config_payload = _validated_initialization_config_payload(
+        initialization_config_payload,
+        dataset_sha256=dataset_sha256,
+        dataset_item_count=dataset_item_count,
+        seed=seed,
+    )
 
     initial_state = _clone_cpu_state_mapping(initial_model_state)
     post_state = _clone_cpu_state_mapping(post_kmeans_model_state)
     _validate_state_layouts(initial_state, post_state)
     rng_before = _clone_rng_state(rng_before_model_initialization)
     rng_training = _clone_rng_state(rng_at_training_start)
-    indices = torch.as_tensor(
+    indices = _validated_initial_batch_indices(
         initial_batch_indices,
-        dtype=torch.long,
-        device="cpu",
-    ).clone()
-    if indices.ndim != 1:
-        raise ValueError("initial_batch_indices must be one-dimensional")
-    inputs = initial_batch_inputs.detach().to(device="cpu").clone()
+        dataset_item_count=dataset_item_count,
+        seed=seed,
+    )
+    inputs = _validated_initial_batch_inputs(
+        initial_batch_inputs,
+        indices=indices,
+    )
     used_code_counts = _normalize_used_code_counts(
         initial_batch_used_code_counts
     )
@@ -761,7 +844,6 @@ def save_common_initialization(
     if calculated_rolling_hash != epoch_plan_rolling_hash:
         raise ValueError("epoch plan rolling hash mismatch")
 
-    config_payload = copy.deepcopy(initialization_config_payload)
     config_hash = hash_json(config_payload)
     initial_model_hash = hash_state_dict(initial_state)
     post_model_hash = hash_state_dict(post_state)
@@ -866,13 +948,13 @@ def _validate_model_load_target(
 def load_common_initialization(
     path: Path,
     *,
-    model,
-    expected_dataset_sha256,
-    expected_dataset_item_count,
-    expected_seed,
-    expected_initialization_config_hash,
-    expected_epoch_plan_rolling_hash,
-) -> dict:
+    model: nn.Module,
+    expected_dataset_sha256: str,
+    expected_dataset_item_count: int,
+    expected_seed: int,
+    expected_initialization_config_hash: str,
+    expected_epoch_plan_rolling_hash: str,
+) -> dict[str, Any]:
     artifact = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(artifact, Mapping):
         raise ValueError("common initialization artifact must be a mapping")
@@ -930,7 +1012,15 @@ def load_common_initialization(
         calculated_codebook_hash,
     )
 
-    config_hash = hash_json(artifact["initialization_config"])
+    if type(artifact["initialization_config"]) is not dict:
+        raise TypeError("initialization config must be a dict")
+    config_payload = _validated_initialization_config_payload(
+        artifact["initialization_config"],
+        dataset_sha256=dataset["sha256"],
+        dataset_item_count=dataset["item_count"],
+        seed=artifact["seed"],
+    )
+    config_hash = hash_json(config_payload)
     _require_equal(
         "initialization config hash",
         artifact["initialization_config_hash"],
@@ -972,18 +1062,35 @@ def load_common_initialization(
         ),
         "initial batch",
     )
-    if not isinstance(initial_batch["indices"], torch.Tensor):
-        raise TypeError("initial batch indices must be a tensor")
+    if not isinstance(initial_batch["indices"], Tensor):
+        raise TypeError("initial batch indices must be a torch.Tensor")
     calculated_indices_hash = hash_tensor(initial_batch["indices"])
     _require_equal(
         "initial batch indices hash",
         initial_batch["indices_hash"],
         calculated_indices_hash,
     )
+    validated_indices = _validated_initial_batch_indices(
+        initial_batch["indices"],
+        dataset_item_count=dataset["item_count"],
+        seed=artifact["seed"],
+    )
+    if not torch.equal(validated_indices, initial_batch["indices"]):
+        raise ValueError("initial batch indices changed during validation")
     if type(initial_batch["input_tensor_hash"]) is not str:
         raise TypeError("initial batch input hash must be a string")
-    _normalize_used_code_counts(initial_batch["used_code_counts"])
+    if type(initial_batch["used_code_counts"]) is not list:
+        raise TypeError("initial batch used_code_counts must be a list")
+    used_code_counts = _normalize_used_code_counts(
+        initial_batch["used_code_counts"]
+    )
+    if len(used_code_counts) != len(_post_kmeans_codebook_state(post_state)):
+        raise ValueError(
+            "initial batch used_code_counts must match the number of codebooks"
+        )
 
+    if type(artifact["epoch_plan_hashes"]) is not list:
+        raise TypeError("epoch_plan_hashes must be a list")
     normalized_epoch_hashes = _normalize_epoch_hashes(
         artifact["epoch_plan_hashes"]
     )
