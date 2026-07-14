@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -571,3 +573,30 @@ def test_snapshot_append_rolls_back_partial_write_and_fsyncs_before_metadata(
 
     assert events.index("fsync") < events.index("metadata") < events.index("checkpoint")
     assert history.record_count == 1
+
+
+
+def test_actual_script_registers_stable_fully_qualified_gin_selector(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "dispatch.gin"
+    config.write_text(
+        'train_rqvae_diagnostic.train.run_mode = "intentional-dispatch-probe"\n'
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(trainer.__file__).resolve()),
+            str(config),
+            "--prepare-common-initialization",
+        ],
+        cwd=Path(trainer.__file__).resolve().parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "unsupported diagnostic run mode: intentional-dispatch-probe" in result.stderr
+    assert "No configurable matching" not in result.stderr

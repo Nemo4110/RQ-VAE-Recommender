@@ -736,7 +736,7 @@ def prepare_common_initialization_from_gin() -> dict[str, Any]:
     return _prepare_common_initialization(**_resolved_train_kwargs())
 
 
-@gin.configurable
+@gin.configurable(module="train_rqvae_diagnostic")
 def train(
     run_mode: Literal["smoke", "bounded"] = "smoke",
     optimizer_name: Literal["adagrad", "adamw"] = "adagrad",
