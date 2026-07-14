@@ -6,6 +6,7 @@ from data.schemas import TokenizedSeqBatch
 from data.utils import batch_to
 from einops import rearrange
 from einops import pack
+from modules.tokenizer.fixed_collision import build_fixed_four_token_ids
 from modules.utils import eval_mode
 from modules.rqvae import RqVae
 from typing import List
@@ -35,6 +36,7 @@ class SemanticIdTokenizer(nn.Module):
         commitment_weight: float = 0.25,
         rqvae_weights_path: Optional[str] = None,
         rqvae_hf_model_path: Optional[str] = None,
+        collision_token_cardinality: Optional[int] = None,
         rqvae_codebook_normalize: bool = False,
         rqvae_sim_vq: bool = False,
     ) -> None:
@@ -88,6 +90,7 @@ class SemanticIdTokenizer(nn.Module):
         self.rq_vae.eval()
 
         self.codebook_size = codebook_size
+        self.collision_token_cardinality = collision_token_cardinality
         self.n_layers = n_layers
         self.reset()
 
@@ -105,9 +108,8 @@ class SemanticIdTokenizer(nn.Module):
 
     @torch.no_grad
     @eval_mode
-    def precompute_corpus_ids(self, movie_dataset: ItemData) -> Tensor:
-        cached_ids = None
-        dedup_dim = []
+    def _precompute_three_token_ids(self, movie_dataset: ItemData) -> Tensor:
+        batches = []
         sampler = BatchSampler(
             SequentialSampler(range(len(movie_dataset))),
             batch_size=512,
@@ -120,23 +122,35 @@ class SemanticIdTokenizer(nn.Module):
             collate_fn=lambda batch: batch[0],
         )
         for batch in dataloader:
-            batch_ids = self.forward(batch_to(batch, self.rq_vae.device)).sem_ids
-            # Detect in-batch duplicates
-            is_hit = self._get_hits(batch_ids, batch_ids)
-            hits = torch.tril(is_hit, diagonal=-1).sum(axis=-1)
-            assert hits.min() >= 0
-            if cached_ids is None:
-                cached_ids = batch_ids.clone()
-            else:
-                # Detect batch-cache duplicates
-                is_hit = self._get_hits(batch_ids, cached_ids)
-                hits += is_hit.sum(axis=-1)
-                cached_ids = pack([cached_ids, batch_ids], "* d")[0]
-            dedup_dim.append(hits)
-        # Concatenate new column to deduplicate ids
-        dedup_dim_tensor = pack(dedup_dim, "*")[0]
-        self.cached_ids = pack([cached_ids, dedup_dim_tensor], "b *")[0]
+            batches.append(
+                self.forward(batch_to(batch, self.rq_vae.device)).sem_ids
+            )
+        return pack(batches, "* d")[0]
 
+    @torch.no_grad
+    @eval_mode
+    def precompute_corpus_ids(self, movie_dataset: ItemData) -> Tensor:
+        three_token_ids = self._precompute_three_token_ids(movie_dataset)
+        if self.collision_token_cardinality is not None:
+            result = build_fixed_four_token_ids(
+                three_token_ids,
+                collision_cardinality=self.collision_token_cardinality,
+            )
+            self.cached_ids = result.four_token_ids.to(three_token_ids.device)
+            return self.cached_ids
+
+        seen: dict[tuple[int, int, int], int] = {}
+        fourth = torch.empty(
+            (three_token_ids.shape[0], 1),
+            dtype=torch.long,
+            device=three_token_ids.device,
+        )
+        for item_index, code in enumerate(three_token_ids.detach().cpu().tolist()):
+            key = tuple(int(token) for token in code)
+            collision_index = seen.get(key, 0)
+            fourth[item_index, 0] = collision_index
+            seen[key] = collision_index + 1
+        self.cached_ids = pack([three_token_ids, fourth], "b *")[0]
         return self.cached_ids
 
     def _tokenize_seq_batch_from_cached(self, ids: Tensor) -> Tensor:
