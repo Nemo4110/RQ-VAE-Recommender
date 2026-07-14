@@ -5,8 +5,10 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -217,12 +219,43 @@ def planned_snapshot_states(
     ]
 
 
+def _fsync_parent(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(Path(path).parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path = Path(path)
+    destination = Path(path)
     data = (canonical_json(dict(payload)) + "\n").encode("utf-8")
-    with path.open("xb") as stream:
-        stream.write(data)
-        stream.flush()
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    published = False
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary_path, destination)
+        published = True
+        _fsync_parent(destination)
+    except BaseException:
+        if published:
+            try:
+                destination.unlink(missing_ok=True)
+                _fsync_parent(destination)
+            except OSError:
+                pass
+        raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _sanitize_failure_json(value: Any) -> Any:
@@ -362,8 +395,12 @@ class SnapshotHistory:
     @classmethod
     def create(cls, path: Path) -> "SnapshotHistory":
         path = Path(path)
-        with path.open("xb"):
-            pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_parent(path)
         return cls(path, 0, hashlib.sha256(b"").hexdigest())
 
     @classmethod
@@ -381,10 +418,28 @@ class SnapshotHistory:
 
     def append(self, payload: Mapping[str, Any]) -> None:
         record = (canonical_json(dict(payload)) + "\n").encode("utf-8")
-        with self.path.open("ab") as stream:
-            stream.write(record)
-            stream.flush()
-        self.record_count, self.rolling_hash = self._metadata(self.path)
+        original_size = self.path.stat().st_size
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+        try:
+            written = 0
+            while written < len(record):
+                count = os.write(descriptor, record[written:])
+                if count <= 0:
+                    raise OSError("snapshot append made no progress")
+                written += count
+            os.fsync(descriptor)
+        except BaseException as error:
+            try:
+                os.ftruncate(descriptor, original_size)
+                os.fsync(descriptor)
+            except BaseException as rollback_error:
+                error.add_note(f"snapshot append rollback failed: {rollback_error}")
+            raise
+        finally:
+            os.close(descriptor)
+        record_count, rolling_hash = self._metadata(self.path)
+        self.record_count = record_count
+        self.rolling_hash = rolling_hash
 
 
 def _external_metadata() -> dict[str, str]:
@@ -455,6 +510,130 @@ def _checkpoint_history(path: Path) -> tuple[int, str]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     history = checkpoint["snapshot_history"]
     return int(history["record_count"]), str(history["rolling_hash"])
+
+
+def _failure_status_for(error: BaseException) -> FailureStatus:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return FailureStatus.OOM
+    if isinstance(error, FloatingPointError):
+        return FailureStatus.NUMERICAL_FAILURE
+    if isinstance(error, FileExistsError):
+        return FailureStatus.OUTPUT_EXISTS
+    if isinstance(error, (ValueError, FileNotFoundError)):
+        return FailureStatus.INVARIANT_MISMATCH
+    if isinstance(error, KeyboardInterrupt):
+        return FailureStatus.INTERRUPTED
+    return FailureStatus.RUNTIME_ERROR
+
+
+def _write_early_terminal_artifacts(
+    *,
+    error: BaseException,
+    save_root: Path,
+    snapshot_path: Path,
+    summary_path: Path,
+    emergency_path: Path,
+    run_mode: str,
+    local_values: Mapping[str, Any],
+    started: float,
+    history: SnapshotHistory | None,
+    config: Mapping[str, Any] | None,
+    complete_hash: str | None,
+    invariant_hash: str | None,
+    initialization_hash: str | None,
+    epoch_rolling_hash: str | None,
+) -> None:
+    status = _failure_status_for(error)
+    message = str(error)
+    unavailable_rng_hash = hashlib.sha256(
+        b"rng unavailable during diagnostic initialization"
+    ).hexdigest()
+    write_emergency_failure(
+        emergency_path,
+        failure_status=status,
+        failure_message=message,
+        boundary="initialization_transaction",
+        completed_epoch=0,
+        optimizer_step=0,
+        attempted_optimizer_step=0,
+        losses=None,
+        gradient_stats=None,
+        model_hash=None,
+        optimizer_state_hash=None,
+        rng_hash=unavailable_rng_hash,
+        common_initialization_hash=None,
+        invariant_config_hash=invariant_hash,
+    )
+    collapse = classify_collapse({}, failure_status=status)
+    summary = {
+        "dataset": "amazon-beauty",
+        "dataset_split": local_values["dataset_split"],
+        "dataset_item_count": local_values["dataset_item_count"],
+        "training_item_count": None,
+        "model": {
+            "name": "RQ-VAE",
+            "input_dim": local_values["vae_input_dim"],
+            "hidden_dims": list(local_values["vae_hidden_dims"]),
+            "embed_dim": local_values["vae_embed_dim"],
+            "codebook_size": local_values["vae_codebook_size"],
+            "n_layers": local_values["vae_n_layers"],
+            "commitment_weight": local_values["commitment_weight"],
+            "gumbel_temperature": local_values["gumbel_temperature"],
+        },
+        "seed": local_values["seed"],
+        "config": None if config is None else dict(config),
+        "complete_config_hash": complete_hash,
+        "invariant_config_hash": invariant_hash,
+        "initialization_config_hash": initialization_hash,
+        "common_initialization_hash": None,
+        "epoch_plan_rolling_hash": epoch_rolling_hash,
+        "optimizer": None,
+        "completed_epoch": 0,
+        "optimizer_step": 0,
+        "losses": {},
+        "collapse": collapse,
+        "failure_status": status.value,
+        "failure_message": message,
+        "timings": {
+            "elapsed_seconds": time.perf_counter() - started,
+            "startup_seconds": None,
+            "steady_step_seconds": None,
+            "full_corpus_snapshot_seconds": None,
+            "peak_allocated_vram_bytes": None,
+            "peak_reserved_vram_bytes": None,
+        },
+        "device": {"type": "cuda", "metadata_available": False},
+        "external": {
+            "url": "https://github.com/EdoardoBotta/RQ-VAE-Recommender",
+            "commit": None,
+            "branch": None,
+            "checkout_path": str(Path(__file__).resolve().parent),
+            "implementation": "locally_modified_third_party",
+        },
+        "artifacts": {
+            "output_root": str(save_root),
+            "config_path": local_values["config_path"],
+            "common_initialization_path": str(
+                Path(local_values["common_initialization_path"])
+                .expanduser()
+                .resolve()
+            ),
+            "snapshot_jsonl_path": str(snapshot_path),
+            "snapshot_record_count": 0 if history is None else history.record_count,
+            "snapshot_rolling_hash": None if history is None else history.rolling_hash,
+            "checkpoint_path": None,
+            "emergency_failure_path": str(emergency_path),
+            "summary_path": str(summary_path),
+            "log_path": str(save_root / "train.log"),
+            "final_checkpoint_path": None,
+            "decoder_eligible_symlink": None,
+        },
+        "evidence_level": evidence_level(run_mode),
+        "final_assignment": None,
+        "local_promising": None,
+        "paper_gate_passed": None,
+    }
+    _exclusive_json(summary_path, summary)
 
 
 def _synchronize() -> None:
@@ -610,31 +789,21 @@ def train(
     emergency_path = save_root / "emergency_failure.json"
     if resume_checkpoint is None:
         save_root.mkdir(parents=True, exist_ok=False)
-        history = SnapshotHistory.create(snapshot_path)
-    else:
-        if not save_root.is_dir():
-            raise FileNotFoundError("resume output root does not exist")
-        if summary_path.exists() or emergency_path.exists():
-            raise FileExistsError("resume output root already contains terminal artifacts")
-        count, digest = _checkpoint_history(Path(resume_checkpoint))
-        history = SnapshotHistory.resume(
-            snapshot_path,
-            expected_record_count=count,
-            expected_rolling_hash=digest,
-        )
+    elif not save_root.is_dir():
+        raise FileNotFoundError("resume output root does not exist")
 
     started = time.perf_counter()
     startup_finished: float | None = None
     snapshot_seconds: list[float] = []
     step_seconds: list[float] = []
     device = torch.device("cuda")
-    torch.cuda.reset_peak_memory_stats()
-    config = _training_config(local_values)
-    complete_hash = complete_config_hash(config)
-    invariant_hash = invariant_config_hash(config)
-    initialization_hash = initialization_config_hash(config)
-    epoch_hashes = epoch_plan_hashes(dataset_item_count, seed, 500)
-    epoch_rolling_hash = rolling_epoch_plan_hash(dataset_item_count, seed, 500)
+    history: SnapshotHistory | None = None
+    config: dict[str, Any] | None = None
+    complete_hash: str | None = None
+    invariant_hash: str | None = None
+    initialization_hash: str | None = None
+    epoch_hashes: list[str] | None = None
+    epoch_rolling_hash: str | None = None
     common_hash: str | None = None
     training_item_count: int | None = None
     model: torch.nn.Module | None = None
@@ -652,6 +821,48 @@ def train(
     failure_status = FailureStatus.COMPLETE
     failure_message: str | None = None
     deadline_pending = False
+
+    try:
+        if resume_checkpoint is None:
+            history = SnapshotHistory.create(snapshot_path)
+        else:
+            if summary_path.exists() or emergency_path.exists():
+                raise FileExistsError(
+                    "resume output root already contains terminal artifacts"
+                )
+            count, digest = _checkpoint_history(Path(resume_checkpoint))
+            history = SnapshotHistory.resume(
+                snapshot_path,
+                expected_record_count=count,
+                expected_rolling_hash=digest,
+            )
+        config = _training_config(local_values)
+        complete_hash = complete_config_hash(config)
+        invariant_hash = invariant_config_hash(config)
+        initialization_hash = initialization_config_hash(config)
+        epoch_hashes = epoch_plan_hashes(dataset_item_count, seed, 500)
+        epoch_rolling_hash = rolling_epoch_plan_hash(dataset_item_count, seed, 500)
+        torch.cuda.reset_peak_memory_stats()
+    except BaseException as error:
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            torch.cuda.empty_cache()
+        _write_early_terminal_artifacts(
+            error=error,
+            save_root=save_root,
+            snapshot_path=snapshot_path,
+            summary_path=summary_path,
+            emergency_path=emergency_path,
+            run_mode=run_mode,
+            local_values=local_values,
+            started=started,
+            history=history,
+            config=config,
+            complete_hash=complete_hash,
+            invariant_hash=invariant_hash,
+            initialization_hash=initialization_hash,
+            epoch_rolling_hash=epoch_rolling_hash,
+        )
+        raise
 
     def write_current_emergency(
         *,

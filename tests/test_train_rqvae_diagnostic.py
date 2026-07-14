@@ -451,3 +451,123 @@ def test_epoch_100_cadence_checkpoint_is_reused_before_epoch_101_deadline(
         completed_epoch=100,
         optimizer_step=1200,
     ) is path
+
+
+
+def test_early_cuda_initialization_failure_writes_terminal_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        trainer.torch.cuda,
+        "reset_peak_memory_stats",
+        lambda: (_ for _ in ()).throw(RuntimeError("early CUDA reset failed")),
+    )
+    save_root = tmp_path / "early-failure"
+
+    with pytest.raises(RuntimeError, match="early CUDA reset failed"):
+        trainer.train(
+            save_dir_root=str(save_root),
+            common_initialization_path=str(tmp_path / "common.pt"),
+            run_stop_utc="2099-01-01T00:00:00Z",
+        )
+
+    emergency = json.loads((save_root / "emergency_failure.json").read_text())
+    summary = json.loads((save_root / "summary.json").read_text())
+    assert emergency["failure_status"] == "runtime_error"
+    assert emergency["model_hash"] is None
+    assert emergency["optimizer_state_hash"] is None
+    assert summary["failure_status"] == "runtime_error"
+    assert summary["collapse"]["collapse_class"] == "not_evaluable"
+
+
+def test_exclusive_json_fsyncs_before_link_and_cleans_failed_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "summary.json"
+    events: list[str] = []
+    real_fsync = trainer.os.fsync
+    real_link = trainer.os.link
+
+    def tracked_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def tracked_link(source: object, target: object) -> None:
+        events.append("link")
+        real_link(source, target)
+
+    monkeypatch.setattr(trainer.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(trainer.os, "link", tracked_link)
+    trainer._exclusive_json(destination, {"ok": True})
+
+    assert events[0] == "fsync"
+    assert events[1] == "link"
+    assert events[2] == "fsync"
+    assert json.loads(destination.read_text()) == {"ok": True}
+    assert not list(tmp_path.glob(".summary.json.*.tmp"))
+
+    failed = tmp_path / "failed.json"
+    monkeypatch.setattr(
+        trainer.os,
+        "link",
+        lambda *args: (_ for _ in ()).throw(OSError("link failed")),
+    )
+    with pytest.raises(OSError, match="link failed"):
+        trainer._exclusive_json(failed, {"ok": False})
+    assert not failed.exists()
+    assert not list(tmp_path.glob(".failed.json.*.tmp"))
+
+
+def test_snapshot_append_rolls_back_partial_write_and_fsyncs_before_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    history = trainer.SnapshotHistory.create(path)
+    original_count = history.record_count
+    original_hash = history.rolling_hash
+    real_write = trainer.os.write
+    calls = 0
+
+    def partial_then_fail(fd: int, data: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, data[: max(1, len(data) // 2)])
+        raise OSError("disk write failed")
+
+    monkeypatch.setattr(trainer.os, "write", partial_then_fail)
+    with pytest.raises(OSError, match="disk write failed"):
+        history.append({"optimizer_step": 1})
+
+    assert path.read_bytes() == b""
+    assert history.record_count == original_count
+    assert history.rolling_hash == original_hash
+
+    monkeypatch.setattr(trainer.os, "write", real_write)
+    events: list[str] = []
+    real_fsync = trainer.os.fsync
+    real_metadata = trainer.SnapshotHistory._metadata
+
+    def tracked_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def tracked_metadata(snapshot_path: Path) -> tuple[int, str]:
+        events.append("metadata")
+        return real_metadata(snapshot_path)
+
+    monkeypatch.setattr(trainer.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(
+        trainer.SnapshotHistory,
+        "_metadata",
+        staticmethod(tracked_metadata),
+    )
+    history.append({"optimizer_step": 1})
+    events.append("checkpoint")
+
+    assert events.index("fsync") < events.index("metadata") < events.index("checkpoint")
+    assert history.record_count == 1
