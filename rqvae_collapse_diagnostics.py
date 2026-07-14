@@ -7,6 +7,7 @@ import os
 import random
 import struct
 import tempfile
+from collections import defaultdict
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -1296,15 +1297,28 @@ def _validate_optimizer_matches_spec(
 def _snapshot_jsonl_metadata(path: Path) -> tuple[int, str]:
     snapshot_path = Path(path)
     data = snapshot_path.read_bytes()
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("snapshot history must be valid UTF-8") from error
     if data and not data.endswith(b"\n"):
         raise ValueError(
             "snapshot history final record must include its terminating newline"
         )
-    return data.count(b"\n"), hashlib.sha256(data).hexdigest()
+    records = data.splitlines(keepends=True)
+    for index, record in enumerate(records, start=1):
+        record_bytes = record[:-1]
+        if not record_bytes.strip():
+            raise ValueError(f"snapshot history record {index} must not be blank")
+        try:
+            record_text = record_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"snapshot history record {index} must be valid UTF-8"
+            ) from error
+        try:
+            json.loads(record_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"snapshot history record {index} must contain valid JSON"
+            ) from error
+    return len(records), hashlib.sha256(data).hexdigest()
 
 
 def _validate_snapshot_history(
@@ -1328,6 +1342,15 @@ def _validate_snapshot_history(
         raise ValueError("snapshot history rolling hash mismatch")
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    file_descriptor = os.open(Path(path).parent, flags)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
 def _exclusive_torch_publish(path: Path, payload: object) -> None:
     destination = Path(path)
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -1337,9 +1360,22 @@ def _exclusive_torch_publish(path: Path, payload: object) -> None:
     )
     os.close(file_descriptor)
     temporary_path = Path(temporary_name)
+    published = False
     try:
         torch.save(payload, temporary_path)
+        with temporary_path.open("rb") as temporary_file:
+            os.fsync(temporary_file.fileno())
         os.link(temporary_path, destination)
+        published = True
+        _fsync_parent_directory(destination)
+    except BaseException:
+        if published:
+            try:
+                destination.unlink(missing_ok=True)
+                _fsync_parent_directory(destination)
+            except OSError:
+                pass
+        raise
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -1518,6 +1554,80 @@ def _validate_optimizer_state_structure(
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("optimizer state is incompatible with live optimizer") from error
 
+
+
+
+def _clone_runtime_value(value: object) -> object:
+    if isinstance(value, Tensor):
+        return value.detach().clone()
+    if isinstance(value, Mapping):
+        return {key: _clone_runtime_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_runtime_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_runtime_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _capture_optimizer_runtime_state(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    return {
+        "state": [
+            (parameter, _clone_runtime_value(value))
+            for parameter, value in optimizer.state.items()
+        ],
+        "param_groups": [
+            {
+                key: list(value) if key == "params" else copy.deepcopy(value)
+                for key, value in group.items()
+            }
+            for group in optimizer.param_groups
+        ],
+        "defaults": copy.deepcopy(optimizer.defaults),
+    }
+
+
+def _restore_optimizer_runtime_state(
+    optimizer: torch.optim.Optimizer,
+    snapshot: Mapping[str, Any],
+) -> None:
+    optimizer.state = defaultdict(
+        dict,
+        {
+            parameter: _clone_runtime_value(value)
+            for parameter, value in snapshot["state"]
+        },
+    )
+    optimizer.param_groups = [
+        {
+            key: list(value) if key == "params" else copy.deepcopy(value)
+            for key, value in group.items()
+        }
+        for group in snapshot["param_groups"]
+    ]
+    optimizer.defaults = copy.deepcopy(snapshot["defaults"])
+
+
+def _restore_model_state_direct(
+    model: nn.Module,
+    snapshot: Mapping[str, Tensor],
+) -> None:
+    current_state = model.state_dict()
+    _validate_state_layouts(current_state, snapshot)
+    with torch.no_grad():
+        for key, target in current_state.items():
+            target.copy_(snapshot[key].to(device=target.device))
+
+
+def _restore_rng_state_direct(state: RngState) -> None:
+    random.setstate(copy.deepcopy(state["python"]))
+    np.random.set_state(_clone_numpy_rng_state(state["numpy"]))
+    torch.set_rng_state(state["torch_cpu"].detach().to(device="cpu").clone())
+    if state["torch_cuda"]:
+        torch.cuda.set_rng_state_all(
+            [value.detach().to(device="cpu").clone() for value in state["torch_cuda"]]
+        )
 
 def load_diagnostic_checkpoint(
     path: Path,
@@ -1700,11 +1810,23 @@ def load_diagnostic_checkpoint(
         expected_rolling_hash=snapshot_history["rolling_hash"],
     )
 
-    optimizer.load_state_dict(optimizer_state)
-    model.load_state_dict(model_state, strict=True)
-    for layer in model.layers:
-        layer.kmeans_initted = True
-    restore_rng_state(rng_state)
+    live_model_state = clone_cpu_state_dict(model)
+    live_optimizer_state = _capture_optimizer_runtime_state(optimizer)
+    live_rng_state = capture_rng_state()
+    live_kmeans_flags = [layer.kmeans_initted for layer in model.layers]
+    try:
+        optimizer.load_state_dict(optimizer_state)
+        model.load_state_dict(model_state, strict=True)
+        for layer in model.layers:
+            layer.kmeans_initted = True
+        restore_rng_state(rng_state)
+    except BaseException:
+        _restore_model_state_direct(model, live_model_state)
+        _restore_optimizer_runtime_state(optimizer, live_optimizer_state)
+        for layer, flag in zip(model.layers, live_kmeans_flags, strict=True):
+            layer.kmeans_initted = flag
+        _restore_rng_state_direct(live_rng_state)
+        raise
     return {
         "start_epoch": completed_epoch + 1,
         "optimizer_step": optimizer_step,
