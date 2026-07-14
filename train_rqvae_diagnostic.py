@@ -225,6 +225,18 @@ def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
         stream.flush()
 
 
+def _sanitize_failure_json(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {str(key): _sanitize_failure_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_failure_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_failure_json(item) for item in value]
+    return value
+
+
 def write_emergency_failure(
     path: Path,
     *,
@@ -253,8 +265,10 @@ def write_emergency_failure(
         "completed_epoch": completed_epoch,
         "optimizer_step": optimizer_step,
         "attempted_optimizer_step": attempted_optimizer_step,
-        "losses": None if losses is None else dict(losses),
-        "gradient_stats": None if gradient_stats is None else dict(gradient_stats),
+        "losses": None if losses is None else _sanitize_failure_json(losses),
+        "gradient_stats": (
+            None if gradient_stats is None else _sanitize_failure_json(gradient_stats)
+        ),
         "model_hash": model_hash,
         "optimizer_state_hash": optimizer_state_hash,
         "rng_hash": rng_hash,
@@ -263,6 +277,64 @@ def write_emergency_failure(
     }
     _exclusive_json(Path(path), payload)
     return payload
+
+
+def write_oom_emergency_failure(
+    path: Path,
+    *,
+    failure_message: str,
+    completed_epoch: int,
+    optimizer_step: int,
+    attempted_optimizer_step: int,
+    losses: Mapping[str, float] | None,
+    cached_rng_hash: str,
+    common_initialization_hash: str | None,
+    invariant_config_hash: str | None,
+) -> dict[str, Any]:
+    return write_emergency_failure(
+        path,
+        failure_status=FailureStatus.OOM,
+        failure_message=failure_message,
+        boundary="cpu_only_oom",
+        completed_epoch=completed_epoch,
+        optimizer_step=optimizer_step,
+        attempted_optimizer_step=attempted_optimizer_step,
+        losses=losses,
+        gradient_stats=None,
+        model_hash=None,
+        optimizer_state_hash=None,
+        rng_hash=cached_rng_hash,
+        common_initialization_hash=common_initialization_hash,
+        invariant_config_hash=invariant_config_hash,
+    )
+
+
+def reusable_checkpoint_at_position(
+    path: Path,
+    *,
+    validated_resume_checkpoint: Path | None,
+    completed_epoch: int,
+    optimizer_step: int,
+) -> Path:
+    checkpoint_path = path
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(checkpoint_path)
+    if (
+        validated_resume_checkpoint is None
+        or validated_resume_checkpoint.resolve() != checkpoint_path.resolve()
+    ):
+        raise FileExistsError(
+            f"refusing to reuse unvalidated immutable checkpoint {checkpoint_path}"
+        )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    training = checkpoint.get("training") if isinstance(checkpoint, Mapping) else None
+    expected = {
+        "completed_epoch": completed_epoch,
+        "optimizer_step": optimizer_step,
+    }
+    if not isinstance(training, Mapping) or dict(training) != expected:
+        raise ValueError("existing validated checkpoint training position mismatch")
+    return checkpoint_path
 
 
 class SnapshotHistory:
@@ -569,6 +641,8 @@ def train(
     last_delta: Mapping[str, Any] | None = None
     last_snapshot: dict[str, Any] | None = None
     last_checkpoint: Path | None = None
+    validated_resume_checkpoint: Path | None = None
+    last_safe_rng_hash: str | None = None
     failure_status = FailureStatus.COMPLETE
     failure_message: str | None = None
     deadline_pending = False
@@ -640,6 +714,13 @@ def train(
         path = checkpoint_path_for(
             save_root, completed_epoch=epoch, optimizer_step=optimizer_step
         )
+        if path.exists():
+            return reusable_checkpoint_at_position(
+                path,
+                validated_resume_checkpoint=validated_resume_checkpoint,
+                completed_epoch=epoch,
+                optimizer_step=optimizer_step,
+            )
         save_diagnostic_checkpoint(
             path,
             model=model,
@@ -698,7 +779,7 @@ def train(
             },
             "completed_epoch": completed_epoch,
             "optimizer_step": optimizer_step,
-            "losses": last_losses,
+            "losses": _sanitize_failure_json(last_losses),
             "collapse": collapse,
             "failure_status": status.value,
             "failure_message": message,
@@ -747,6 +828,7 @@ def train(
             training_dataset = Subset(canonical_dataset, range(max_items))
         training_item_count = len(training_dataset)
         seed_all(seed)
+        last_safe_rng_hash = hash_rng_state(capture_rng_state())
         model = build_paper_model(
             input_dim=vae_input_dim,
             hidden_dims=list(vae_hidden_dims),
@@ -786,8 +868,9 @@ def train(
         )
         start_epoch = 1
         if resume_checkpoint is not None:
+            validated_resume_checkpoint = Path(resume_checkpoint).expanduser().resolve()
             resume = load_diagnostic_checkpoint(
-                Path(resume_checkpoint).expanduser().resolve(),
+                validated_resume_checkpoint,
                 model=model,
                 optimizer=optimizer,
                 optimizer_spec=spec,
@@ -829,6 +912,7 @@ def train(
                 step_started = time.perf_counter()
                 device_batch = batch_to(batch, device)
                 optimizer.zero_grad(set_to_none=True)
+                last_safe_rng_hash = hash_rng_state(capture_rng_state())
                 output = model(device_batch, gumbel_t=gumbel_temperature)
                 step_losses = {
                     "loss": float(output.loss.detach().cpu().item()),
@@ -911,14 +995,29 @@ def train(
         failure_message = str(error)
         if not emergency_path.exists():
             try:
-                write_current_emergency(
-                    status=failure_status,
-                    message=failure_message,
-                    boundary=("cpu_only_oom" if failure_status is FailureStatus.OOM else "exception"),
-                    attempted_optimizer_step=optimizer_step + 1,
-                    losses=last_losses or None,
-                    gradient_stats=last_gradient,
-                )
+                if failure_status is FailureStatus.OOM:
+                    if last_safe_rng_hash is None:
+                        raise RuntimeError("no cached pre-boundary RNG hash for OOM")
+                    write_oom_emergency_failure(
+                        emergency_path,
+                        failure_message=failure_message,
+                        completed_epoch=completed_epoch,
+                        optimizer_step=optimizer_step,
+                        attempted_optimizer_step=optimizer_step + 1,
+                        losses=last_losses or None,
+                        cached_rng_hash=last_safe_rng_hash,
+                        common_initialization_hash=common_hash,
+                        invariant_config_hash=invariant_hash,
+                    )
+                else:
+                    write_current_emergency(
+                        status=failure_status,
+                        message=failure_message,
+                        boundary="exception",
+                        attempted_optimizer_step=optimizer_step + 1,
+                        losses=last_losses or None,
+                        gradient_stats=last_gradient,
+                    )
             except BaseException:
                 pass
         if not summary_path.exists():

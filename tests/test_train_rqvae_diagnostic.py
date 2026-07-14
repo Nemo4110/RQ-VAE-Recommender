@@ -303,3 +303,132 @@ def test_summary_does_not_probe_nested_locals_for_dataset_state() -> None:
     source = inspect.getsource(trainer.train)
     assert '"training_dataset" in locals()' not in source
     assert '"training_item_count": training_item_count' in source
+
+
+
+def test_nonfinite_emergency_losses_are_sanitized_without_reclassification(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nonfinite-emergency.json"
+    payload = trainer.write_emergency_failure(
+        path,
+        failure_status=FailureStatus.NUMERICAL_FAILURE,
+        failure_message="nonfinite loss before backward",
+        boundary="pre_backward_pre_update",
+        completed_epoch=0,
+        optimizer_step=0,
+        attempted_optimizer_step=1,
+        losses={
+            "loss": float("nan"),
+            "reconstruction_loss": float("inf"),
+            "rqvae_loss": float("-inf"),
+        },
+        gradient_stats=None,
+        model_hash="1" * 64,
+        optimizer_state_hash="2" * 64,
+        rng_hash="3" * 64,
+        common_initialization_hash="4" * 64,
+        invariant_config_hash="5" * 64,
+    )
+
+    stored = json.loads(path.read_text())
+    assert stored == payload
+    assert stored["failure_status"] == "numerical_failure"
+    assert stored["failure_message"] == "nonfinite loss before backward"
+    assert stored["losses"] == {
+        "loss": None,
+        "reconstruction_loss": None,
+        "rqvae_loss": None,
+    }
+
+
+def test_fully_qualified_gin_config_resolves_module_train_for_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "bounded.gin"
+    config.write_text(
+        "\n".join(
+            [
+                'train_rqvae_diagnostic.train.run_mode = "bounded"',
+                "train_rqvae_diagnostic.train.epochs = 500",
+                "train_rqvae_diagnostic.train.max_items = None",
+                "train_rqvae_diagnostic.train.checkpoint_epochs = (100, 250, 500)",
+                'train_rqvae_diagnostic.train.common_initialization_path = "/tmp/common.pt"',
+            ]
+        )
+        + "\n"
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        trainer,
+        "_prepare_common_initialization",
+        lambda **kwargs: captured.update(kwargs) or {"prepared": True},
+    )
+    trainer.gin.clear_config()
+    try:
+        result = trainer.main([str(config), "--prepare-common-initialization"])
+    finally:
+        trainer.gin.clear_config()
+
+    assert result == {"prepared": True}
+    assert captured["run_mode"] == "bounded"
+    assert captured["epochs"] == 500
+    assert captured["max_items"] is None
+    assert captured["checkpoint_epochs"] == (100, 250, 500)
+
+
+def test_validated_resume_checkpoint_is_reused_at_same_deadline_position(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "checkpoint_epoch_00002_step_0000004.pt"
+    trainer.torch.save(
+        {"training": {"completed_epoch": 2, "optimizer_step": 4}},
+        path,
+    )
+
+    assert trainer.reusable_checkpoint_at_position(
+        path,
+        validated_resume_checkpoint=path,
+        completed_epoch=2,
+        optimizer_step=4,
+    ) is path
+    with pytest.raises(FileExistsError):
+        trainer.reusable_checkpoint_at_position(
+            path,
+            validated_resume_checkpoint=None,
+            completed_epoch=2,
+            optimizer_step=4,
+        )
+
+
+def test_oom_emergency_uses_only_cached_cpu_safe_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("OOM emergency touched live CUDA state")
+
+    monkeypatch.setattr(trainer, "clone_cpu_state_dict", forbidden)
+    monkeypatch.setattr(trainer, "hash_nested_state", forbidden)
+    monkeypatch.setattr(trainer, "capture_rng_state", forbidden)
+    path = tmp_path / "oom-emergency.json"
+
+    payload = trainer.write_oom_emergency_failure(
+        path,
+        failure_message="CUDA out of memory",
+        completed_epoch=3,
+        optimizer_step=36,
+        attempted_optimizer_step=37,
+        losses={"loss": 1.0},
+        cached_rng_hash="a" * 64,
+        common_initialization_hash="b" * 64,
+        invariant_config_hash="c" * 64,
+    )
+
+    assert payload["failure_status"] == "oom"
+    assert payload["boundary"] == "cpu_only_oom"
+    assert payload["model_hash"] is None
+    assert payload["optimizer_state_hash"] is None
+    assert payload["rng_hash"] == "a" * 64
+    assert json.loads(path.read_text()) == payload
