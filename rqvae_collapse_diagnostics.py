@@ -1599,19 +1599,35 @@ def capture_read_only_corpus_snapshot(
     trigger_list = list(triggers)
     if any(type(value) is not str for value in trigger_list):
         raise TypeError("triggers must contain only strings")
+    if not hasattr(model, "layers") or any(
+        not bool(getattr(layer, "kmeans_initted", False))
+        for layer in model.layers
+    ):
+        raise ValueError(
+            "read-only corpus diagnostics require a post-kmeans model"
+        )
 
     was_training = model.training
-    model_hash_before = hash_state_dict(clone_cpu_state_dict(model))
-    optimizer_hash_before = hash_nested_state(optimizer.state_dict())
+    kmeans_states = tuple(layer.kmeans_initted for layer in model.layers)
+    model_state_before = clone_cpu_state_dict(model)
+    model_hash_before = hash_state_dict(model_state_before)
+    optimizer_state_before = copy.deepcopy(optimizer.state_dict())
+    optimizer_hash_before = hash_nested_state(optimizer_state_before)
     rng_before = capture_rng_state()
     rng_hash_before = hash_rng_state(rng_before)
-    generator_state = diagnostic_loader_generator.get_state().detach().cpu().clone()
+    generator_state = (
+        diagnostic_loader_generator.get_state().detach().cpu().clone()
+    )
     generator_hash_before = hash_tensor(generator_state)
 
     all_inputs: list[Tensor] = []
     all_encoded: list[Tensor] = []
     all_semantic_ids: list[Tensor] = []
     residuals_by_layer: list[list[Tensor]] | None = None
+    collection_error: BaseException | None = None
+    collection_traceback: Any = None
+    mutation_checks: dict[str, bool] = {}
+    restoration_error: RuntimeError | None = None
     try:
         model.eval()
         device = next(model.parameters()).device
@@ -1628,35 +1644,89 @@ def capture_read_only_corpus_snapshot(
                 if residuals_by_layer is None:
                     residuals_by_layer = [list() for _ in residual_layers]
                 if len(residual_layers) != len(residuals_by_layer):
-                    raise ValueError("RQ-VAE residual layer count changed across batches")
+                    raise ValueError(
+                        "RQ-VAE residual layer count changed across batches"
+                    )
                 for values, residual in zip(
                     residuals_by_layer,
                     residual_layers,
                     strict=True,
                 ):
                     values.append(residual.detach().cpu())
+    except BaseException as error:
+        collection_error = error
+        collection_traceback = error.__traceback__
     finally:
+        observed_model_hash = hash_state_dict(clone_cpu_state_dict(model))
+        observed_optimizer_hash = hash_nested_state(optimizer.state_dict())
+        observed_kmeans_states = tuple(
+            layer.kmeans_initted for layer in model.layers
+        )
+        mutation_checks = {
+            "model_hash": observed_model_hash == model_hash_before,
+            "optimizer_state_hash": (
+                observed_optimizer_hash == optimizer_hash_before
+            ),
+            "kmeans_state": observed_kmeans_states == kmeans_states,
+        }
+        if not mutation_checks["model_hash"]:
+            model.load_state_dict(model_state_before, strict=True)
+        if not mutation_checks["optimizer_state_hash"]:
+            optimizer.load_state_dict(copy.deepcopy(optimizer_state_before))
+        for layer, state in zip(model.layers, kmeans_states, strict=True):
+            layer.kmeans_initted = state
         diagnostic_loader_generator.set_state(generator_state)
         restore_rng_state(rng_before)
         model.train(was_training)
 
+        restoration_checks = {
+            "model_hash": (
+                hash_state_dict(clone_cpu_state_dict(model))
+                == model_hash_before
+            ),
+            "optimizer_state_hash": (
+                hash_nested_state(optimizer.state_dict())
+                == optimizer_hash_before
+            ),
+            "rng_hash": (
+                hash_rng_state(capture_rng_state()) == rng_hash_before
+            ),
+            "diagnostic_loader_generator_hash": (
+                hash_tensor(diagnostic_loader_generator.get_state())
+                == generator_hash_before
+            ),
+            "model_mode": model.training is was_training,
+            "kmeans_state": (
+                tuple(layer.kmeans_initted for layer in model.layers)
+                == kmeans_states
+            ),
+        }
+        if not all(restoration_checks.values()):
+            failed = sorted(
+                name
+                for name, passed in restoration_checks.items()
+                if not passed
+            )
+            restoration_error = RuntimeError(
+                "failed to restore read-only corpus diagnostic state: "
+                f"{failed}"
+            )
+
+    if collection_error is not None:
+        if restoration_error is not None:
+            collection_error.add_note(str(restoration_error))
+        raise collection_error.with_traceback(collection_traceback)
+    if restoration_error is not None:
+        raise restoration_error
+    if not all(mutation_checks.values()):
+        failed = sorted(
+            name for name, passed in mutation_checks.items() if not passed
+        )
+        raise RuntimeError(
+            f"read-only corpus diagnostics mutated state: {failed}"
+        )
     if not all_inputs or residuals_by_layer is None:
         raise ValueError("canonical_loader must yield at least one batch")
-    model_hash_after = hash_state_dict(clone_cpu_state_dict(model))
-    optimizer_hash_after = hash_nested_state(optimizer.state_dict())
-    rng_hash_after = hash_rng_state(capture_rng_state())
-    generator_hash_after = hash_tensor(diagnostic_loader_generator.get_state())
-    checks = {
-        "model_hash": model_hash_after == model_hash_before,
-        "optimizer_state_hash": optimizer_hash_after == optimizer_hash_before,
-        "rng_hash": rng_hash_after == rng_hash_before,
-        "diagnostic_loader_generator_hash": (
-            generator_hash_after == generator_hash_before
-        ),
-    }
-    if not all(checks.values()):
-        failed = sorted(name for name, passed in checks.items() if not passed)
-        raise RuntimeError(f"read-only corpus diagnostics mutated state: {failed}")
 
     inputs = torch.cat(all_inputs, dim=0)
     encoded = torch.cat(all_encoded, dim=0)

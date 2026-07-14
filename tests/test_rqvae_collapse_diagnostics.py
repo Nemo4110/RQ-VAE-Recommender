@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
+from types import MethodType
 from typing import Any
 from typing import get_type_hints
 
@@ -1146,12 +1147,15 @@ def test_common_initialization_round_trip_validation_and_exclusive_publish(
 
 
 def _tiny_diagnostic_rqvae() -> RqVae:
-    return RqVae(
+    model = RqVae(
         input_dim=4, embed_dim=2, hidden_dims=[3], codebook_size=256,
         codebook_kmeans_init=False, codebook_normalize=False,
         codebook_sim_vq=False, codebook_mode=QuantizeForwardMode.STE,
         n_layers=3, commitment_weight=0.25, n_cat_features=0,
     )
+    for layer in model.layers:
+        layer.kmeans_initted = True
+    return model
 
 
 def test_distribution_stats_use_population_variance_and_fixed_quantiles() -> None:
@@ -1318,3 +1322,144 @@ def test_read_only_snapshot_restores_model_optimizer_rng_loader_and_epoch_plan()
     )
     assert model.training is True
     assert after == before
+
+
+
+def _snapshot_fixture() -> tuple[
+    RqVae,
+    torch.optim.Optimizer,
+    DataLoader,
+    torch.Generator,
+    dict[str, Tensor],
+]:
+    diagnostics.seed_all(20260701)
+    model = _tiny_diagnostic_rqvae()
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    generator = torch.Generator().manual_seed(1234)
+    loader = DataLoader(
+        TensorDataset(torch.arange(32, dtype=torch.float32).reshape(8, 4) / 31),
+        batch_size=3,
+        shuffle=False,
+        num_workers=0,
+        generator=generator,
+    )
+    return (
+        model,
+        optimizer,
+        loader,
+        generator,
+        diagnostics.clone_cpu_state_dict(model),
+    )
+
+
+def _snapshot_observable_state(
+    model: RqVae,
+    optimizer: torch.optim.Optimizer,
+    generator: torch.Generator,
+) -> tuple[str, str, str, str, bool, tuple[bool, ...]]:
+    return (
+        diagnostics.hash_state_dict(diagnostics.clone_cpu_state_dict(model)),
+        diagnostics.hash_nested_state(optimizer.state_dict()),
+        diagnostics.hash_rng_state(diagnostics.capture_rng_state()),
+        diagnostics.hash_tensor(generator.get_state()),
+        model.training,
+        tuple(layer.kmeans_initted for layer in model.layers),
+    )
+
+
+def _install_mutating_semantic_ids(
+    model: RqVae,
+    optimizer: torch.optim.Optimizer,
+    *,
+    raise_after_mutation: bool,
+) -> None:
+    original = model.get_semantic_ids
+
+    def mutating_get_semantic_ids(
+        self: RqVae,
+        inputs: Tensor,
+        gumbel_t: float = 0.001,
+    ) -> object:
+        with torch.no_grad():
+            next(self.parameters()).add_(1.0)
+        first_parameter = next(self.parameters())
+        optimizer.param_groups[0]["lr"] = 0.123
+        optimizer.state[first_parameter]["diagnostic_pollution"] = torch.ones(1)
+        random.random()
+        np.random.random()
+        torch.rand(1)
+        self.layers[0].kmeans_initted = False
+        if raise_after_mutation:
+            raise RuntimeError("synthetic forward failure")
+        return original(inputs, gumbel_t=gumbel_t)
+
+    model.get_semantic_ids = MethodType(mutating_get_semantic_ids, model)
+
+
+def test_snapshot_restores_all_state_before_reraising_forward_exception() -> None:
+    model, optimizer, loader, generator, baseline = _snapshot_fixture()
+    before = _snapshot_observable_state(model, optimizer, generator)
+    _install_mutating_semantic_ids(
+        model,
+        optimizer,
+        raise_after_mutation=True,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic forward failure"):
+        diagnostics.capture_read_only_corpus_snapshot(
+            model=model,
+            optimizer=optimizer,
+            canonical_loader=loader,
+            diagnostic_loader_generator=generator,
+            post_kmeans_state=baseline,
+            optimizer_step=0,
+            completed_epoch=None,
+            triggers=("optimizer_step:0",),
+        )
+
+    assert _snapshot_observable_state(model, optimizer, generator) == before
+
+
+def test_snapshot_restores_detected_mutation_before_raising_invariant() -> None:
+    model, optimizer, loader, generator, baseline = _snapshot_fixture()
+    before = _snapshot_observable_state(model, optimizer, generator)
+    _install_mutating_semantic_ids(
+        model,
+        optimizer,
+        raise_after_mutation=False,
+    )
+
+    with pytest.raises(RuntimeError, match="read-only corpus diagnostics mutated state"):
+        diagnostics.capture_read_only_corpus_snapshot(
+            model=model,
+            optimizer=optimizer,
+            canonical_loader=loader,
+            diagnostic_loader_generator=generator,
+            post_kmeans_state=baseline,
+            optimizer_step=0,
+            completed_epoch=None,
+            triggers=("optimizer_step:0",),
+        )
+
+    assert _snapshot_observable_state(model, optimizer, generator) == before
+
+
+def test_snapshot_rejects_non_post_kmeans_model_without_mutation() -> None:
+    model, optimizer, loader, generator, baseline = _snapshot_fixture()
+    model.layers[1].kmeans_initted = False
+    before = _snapshot_observable_state(model, optimizer, generator)
+
+    with pytest.raises(ValueError, match="post-kmeans"):
+        diagnostics.capture_read_only_corpus_snapshot(
+            model=model,
+            optimizer=optimizer,
+            canonical_loader=loader,
+            diagnostic_loader_generator=generator,
+            post_kmeans_state=baseline,
+            optimizer_step=0,
+            completed_epoch=None,
+            triggers=("optimizer_step:0",),
+        )
+
+    assert _snapshot_observable_state(model, optimizer, generator) == before
