@@ -432,3 +432,22 @@ def test_oom_emergency_uses_only_cached_cpu_safe_hashes(
     assert payload["optimizer_state_hash"] is None
     assert payload["rng_hash"] == "a" * 64
     assert json.loads(path.read_text()) == payload
+
+
+
+def test_epoch_100_cadence_checkpoint_is_reused_before_epoch_101_deadline(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "checkpoint_epoch_00100_step_0001200.pt"
+    trainer.torch.save(
+        {"training": {"completed_epoch": 100, "optimizer_step": 1200}},
+        path,
+    )
+
+    assert trainer.reusable_checkpoint_at_position(
+        path,
+        validated_resume_checkpoint=None,
+        current_process_checkpoint=path,
+        completed_epoch=100,
+        optimizer_step=1200,
+    ) is path

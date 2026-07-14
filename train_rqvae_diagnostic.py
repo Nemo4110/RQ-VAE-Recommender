@@ -315,13 +315,19 @@ def reusable_checkpoint_at_position(
     validated_resume_checkpoint: Path | None,
     completed_epoch: int,
     optimizer_step: int,
+    current_process_checkpoint: Path | None = None,
 ) -> Path:
     checkpoint_path = path
     if not checkpoint_path.exists():
         raise FileNotFoundError(checkpoint_path)
-    if (
-        validated_resume_checkpoint is None
-        or validated_resume_checkpoint.resolve() != checkpoint_path.resolve()
+    reusable_sources = (
+        validated_resume_checkpoint,
+        current_process_checkpoint,
+    )
+    if not any(
+        candidate is not None
+        and candidate.resolve() == checkpoint_path.resolve()
+        for candidate in reusable_sources
     ):
         raise FileExistsError(
             f"refusing to reuse unvalidated immutable checkpoint {checkpoint_path}"
@@ -720,6 +726,7 @@ def train(
                 validated_resume_checkpoint=validated_resume_checkpoint,
                 completed_epoch=epoch,
                 optimizer_step=optimizer_step,
+                current_process_checkpoint=last_checkpoint,
             )
         save_diagnostic_checkpoint(
             path,
