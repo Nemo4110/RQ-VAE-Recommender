@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
+import random
+import struct
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from typing import TypedDict
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -261,3 +269,784 @@ def initialization_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def initialization_config_hash(config: Mapping[str, Any]) -> str:
     return hash_json(initialization_config(config))
+
+
+class RngState(TypedDict):
+    python: object
+    numpy: tuple[object, ...]
+    torch_cpu: torch.Tensor
+    torch_cuda: list[torch.Tensor]
+
+
+_COMMON_ARTIFACT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "artifact_kind",
+        "dataset",
+        "seed",
+        "initialization_config",
+        "initialization_config_hash",
+        "initial_model_state",
+        "initial_model_hash",
+        "post_kmeans_model_state",
+        "post_kmeans_model_hash",
+        "post_kmeans_codebook_hash",
+        "rng_before_model_initialization",
+        "rng_before_model_initialization_hash",
+        "rng_at_training_start",
+        "rng_at_training_start_hash",
+        "initial_batch",
+        "epoch_plan_hashes",
+        "epoch_plan_rolling_hash",
+        "compatibility",
+        "common_initialization_hash",
+    }
+)
+
+_COMPATIBILITY_FIELDS = frozenset(
+    {
+        "dataset_sha256",
+        "dataset_item_count",
+        "seed",
+        "initialization_config_hash",
+        "initial_model_hash",
+        "post_kmeans_model_hash",
+        "post_kmeans_codebook_hash",
+        "initial_batch_indices_hash",
+        "initial_batch_input_hash",
+        "rng_at_training_start_hash",
+        "epoch_plan_rolling_hash",
+    }
+)
+
+
+def hash_tensor(tensor: torch.Tensor) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor value must be a torch.Tensor")
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(value.dtype).encode("ascii"))
+    digest.update(str(tuple(value.shape)).encode("ascii"))
+    digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _update_hash_part(
+    digest: Any,
+    tag: bytes,
+    payload: bytes = b"",
+) -> None:
+    digest.update(len(tag).to_bytes(4, "big"))
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _update_nested_hash(digest: Any, value: object) -> None:
+    if isinstance(value, torch.Tensor):
+        _update_hash_part(digest, b"torch.Tensor", hash_tensor(value).encode("ascii"))
+        return
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise TypeError("NumPy object arrays cannot be hashed deterministically")
+        array = np.ascontiguousarray(value)
+        _update_hash_part(digest, b"numpy.dtype", array.dtype.str.encode("ascii"))
+        _update_hash_part(
+            digest,
+            b"numpy.shape",
+            canonical_json(list(array.shape)).encode("utf-8"),
+        )
+        _update_hash_part(digest, b"numpy.bytes", array.tobytes(order="C"))
+        return
+    if isinstance(value, Mapping):
+        items = sorted(
+            ((str(key), item) for key, item in value.items()),
+            key=lambda pair: pair[0],
+        )
+        string_keys = [key for key, _ in items]
+        if len(string_keys) != len(set(string_keys)):
+            raise ValueError("mapping keys must be unique after string conversion")
+        _update_hash_part(
+            digest,
+            b"mapping",
+            len(items).to_bytes(8, "big"),
+        )
+        for key, item in items:
+            _update_hash_part(digest, b"mapping.key", key.encode("utf-8"))
+            _update_nested_hash(digest, item)
+        return
+    if isinstance(value, list):
+        _update_hash_part(digest, b"list", len(value).to_bytes(8, "big"))
+        for item in value:
+            _update_nested_hash(digest, item)
+        return
+    if isinstance(value, tuple):
+        _update_hash_part(digest, b"tuple", len(value).to_bytes(8, "big"))
+        for item in value:
+            _update_nested_hash(digest, item)
+        return
+    if isinstance(value, Path):
+        _update_hash_part(digest, b"path", str(value).encode("utf-8"))
+        return
+    if isinstance(value, np.generic):
+        _update_nested_hash(digest, value.item())
+        return
+    if value is None:
+        _update_hash_part(digest, b"none")
+        return
+    if isinstance(value, bool):
+        _update_hash_part(digest, b"bool", b"1" if value else b"0")
+        return
+    if isinstance(value, int):
+        _update_hash_part(digest, b"int", str(value).encode("ascii"))
+        return
+    if isinstance(value, float):
+        _update_hash_part(digest, b"float", struct.pack("!d", value))
+        return
+    if isinstance(value, str):
+        _update_hash_part(digest, b"str", value.encode("utf-8"))
+        return
+    if isinstance(value, bytes):
+        _update_hash_part(digest, b"bytes", value)
+        return
+    raise TypeError(f"unsupported nested state value: {type(value).__name__}")
+
+
+def hash_nested_state(value: object) -> str:
+    digest = hashlib.sha256()
+    _update_nested_hash(digest, value)
+    return digest.hexdigest()
+
+
+def seed_all(seed: int) -> None:
+    if type(seed) is not int:
+        raise ValueError("seed must be an int")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _extract_item_tensor(value: object) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    if hasattr(value, "x") and isinstance(value.x, torch.Tensor):
+        return value.x
+    if isinstance(value, Mapping) and isinstance(value.get("x"), torch.Tensor):
+        return value["x"]
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 1
+        and isinstance(value[0], torch.Tensor)
+    ):
+        return value[0]
+    raise TypeError("dataset items must be tensors or expose a tensor-valued x field")
+
+
+def load_items_by_index(dataset: object, indices: object) -> torch.Tensor:
+    index_tensor = torch.as_tensor(indices, dtype=torch.long, device="cpu")
+    if index_tensor.ndim != 1:
+        raise ValueError("indices must be one-dimensional")
+    try:
+        return _extract_item_tensor(dataset[index_tensor])
+    except (IndexError, TypeError, ValueError):
+        return torch.stack(
+            [
+                _extract_item_tensor(dataset[int(index)])
+                for index in index_tensor.tolist()
+            ]
+        )
+
+
+def clone_cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        str(key): value.detach().to(device="cpu").clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _clone_cpu_state_mapping(
+    state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if not isinstance(state, Mapping):
+        raise TypeError("model state must be a mapping")
+    cloned: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if type(key) is not str:
+            raise TypeError("model state keys must be strings")
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"model state value {key} must be a tensor")
+        cloned[key] = value.detach().to(device="cpu").clone()
+    return cloned
+
+
+def hash_state_dict(state: Mapping[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(_clone_cpu_state_mapping(state).items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(hash_tensor(tensor).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _clone_numpy_rng_state(
+    state: tuple[object, ...],
+) -> tuple[object, ...]:
+    return tuple(
+        value.copy() if isinstance(value, np.ndarray) else copy.deepcopy(value)
+        for value in state
+    )
+
+
+def _clone_rng_state(state: Mapping[str, object]) -> RngState:
+    _validate_rng_state(state)
+    return {
+        "python": copy.deepcopy(state["python"]),
+        "numpy": _clone_numpy_rng_state(state["numpy"]),
+        "torch_cpu": state["torch_cpu"].detach().to(device="cpu").clone(),
+        "torch_cuda": [
+            value.detach().to(device="cpu").clone()
+            for value in state["torch_cuda"]
+        ],
+    }
+
+
+def capture_rng_state() -> RngState:
+    numpy_state = np.random.get_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    return {
+        "python": copy.deepcopy(random.getstate()),
+        "numpy": _clone_numpy_rng_state(numpy_state),
+        "torch_cpu": torch.get_rng_state().detach().to(device="cpu").clone(),
+        "torch_cuda": [
+            value.detach().to(device="cpu").clone() for value in cuda_states
+        ],
+    }
+
+
+def _validate_rng_state(state: Mapping[str, object]) -> None:
+    if not isinstance(state, Mapping):
+        raise TypeError("RNG state must be a mapping")
+    expected_fields = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    if set(state) != expected_fields:
+        raise ValueError("RNG state has an invalid schema")
+    if not isinstance(state["numpy"], tuple):
+        raise TypeError("NumPy RNG state must be a tuple")
+    if not isinstance(state["torch_cpu"], torch.Tensor):
+        raise TypeError("CPU torch RNG state must be a tensor")
+    if not isinstance(state["torch_cuda"], list) or any(
+        not isinstance(value, torch.Tensor) for value in state["torch_cuda"]
+    ):
+        raise TypeError("CUDA torch RNG state must be a list of tensors")
+
+    python_probe = random.Random()
+    python_probe.setstate(state["python"])
+    numpy_probe = np.random.RandomState()
+    numpy_probe.set_state(state["numpy"])
+    cpu_probe = torch.Generator(device="cpu")
+    cpu_probe.set_state(state["torch_cpu"].detach().to(device="cpu"))
+
+    cuda_states = state["torch_cuda"]
+    if cuda_states:
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA RNG state cannot be restored without CUDA")
+        if len(cuda_states) != torch.cuda.device_count():
+            raise ValueError("CUDA RNG state count does not match visible devices")
+        for index, cuda_state in enumerate(cuda_states):
+            probe = torch.Generator(device=f"cuda:{index}")
+            probe.set_state(cuda_state.detach().to(device="cpu"))
+
+
+def restore_rng_state(state: Mapping[str, object]) -> None:
+    _validate_rng_state(state)
+    random.setstate(copy.deepcopy(state["python"]))
+    np.random.set_state(_clone_numpy_rng_state(state["numpy"]))
+    torch.set_rng_state(state["torch_cpu"].detach().to(device="cpu").clone())
+    if state["torch_cuda"]:
+        torch.cuda.set_rng_state_all(
+            [
+                value.detach().to(device="cpu").clone()
+                for value in state["torch_cuda"]
+            ]
+        )
+
+
+def hash_rng_state(state: Mapping[str, object]) -> str:
+    _validate_rng_state(state)
+    return hash_nested_state(state)
+
+
+def _require_positive_int(field_name: str, value: object) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{field_name} must be a positive int")
+    return value
+
+
+def epoch_permutation(item_count: int, seed: int, epoch: int) -> torch.Tensor:
+    item_count = _require_positive_int("item_count", item_count)
+    epoch = _require_positive_int("epoch", epoch)
+    if type(seed) is not int:
+        raise ValueError("seed must be an int")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + epoch - 1)
+    return torch.randperm(item_count, generator=generator, device="cpu")
+
+
+def epoch_plan_hashes(
+    item_count: int,
+    seed: int,
+    epochs: int,
+) -> list[str]:
+    epochs = _require_positive_int("epochs", epochs)
+    return [
+        hash_tensor(epoch_permutation(item_count, seed, epoch))
+        for epoch in range(1, epochs + 1)
+    ]
+
+
+def rolling_epoch_plan_hash(
+    item_count: int,
+    seed: int,
+    epochs: int,
+) -> str:
+    return hash_json(epoch_plan_hashes(item_count, seed, epochs))
+
+
+def _post_kmeans_codebook_state(
+    state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    codebooks = {
+        key: value
+        for key, value in state.items()
+        if key.startswith("layers.") and key.endswith(".embedding.weight")
+    }
+    if not codebooks:
+        raise ValueError("post-kmeans model state contains no RQ-VAE codebooks")
+    return codebooks
+
+
+def _hash_codebook_state(state: Mapping[str, torch.Tensor]) -> str:
+    return hash_json(
+        [
+            hash_tensor(tensor)
+            for _, tensor in sorted(_post_kmeans_codebook_state(state).items())
+        ]
+    )
+
+
+def _validate_state_layouts(
+    initial_state: Mapping[str, torch.Tensor],
+    post_state: Mapping[str, torch.Tensor],
+) -> None:
+    if set(initial_state) != set(post_state):
+        raise ValueError("initial and post-kmeans model state keys differ")
+    for key in initial_state:
+        if initial_state[key].shape != post_state[key].shape:
+            raise ValueError(f"model state shape changed for {key}")
+        if initial_state[key].dtype != post_state[key].dtype:
+            raise ValueError(f"model state dtype changed for {key}")
+
+
+def _normalize_epoch_hashes(epoch_hashes: object) -> list[str]:
+    if not isinstance(epoch_hashes, (list, tuple)):
+        raise TypeError("epoch_hashes must be a list or tuple")
+    normalized = list(epoch_hashes)
+    if len(normalized) != 500:
+        raise ValueError("epoch_hashes must contain exactly 500 hashes")
+    if any(
+        type(value) is not str or len(value) != 64
+        for value in normalized
+    ):
+        raise ValueError("epoch_hashes must contain SHA-256 hex strings")
+    return normalized
+
+
+def _normalize_used_code_counts(value: object) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to(device="cpu").tolist()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("initial_batch_used_code_counts must be a list or tuple")
+    counts = list(value)
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise ValueError("initial batch used code counts must be nonnegative ints")
+    return counts
+
+
+def _compatibility_payload(
+    *,
+    dataset_sha256: str,
+    dataset_item_count: int,
+    seed: int,
+    initialization_config_hash_value: str,
+    initial_model_hash: str,
+    post_kmeans_model_hash: str,
+    post_kmeans_codebook_hash: str,
+    initial_batch_indices_hash: str,
+    initial_batch_input_hash: str,
+    rng_at_training_start_hash: str,
+    epoch_plan_rolling_hash: str,
+) -> dict[str, object]:
+    return {
+        "dataset_sha256": dataset_sha256,
+        "dataset_item_count": dataset_item_count,
+        "seed": seed,
+        "initialization_config_hash": initialization_config_hash_value,
+        "initial_model_hash": initial_model_hash,
+        "post_kmeans_model_hash": post_kmeans_model_hash,
+        "post_kmeans_codebook_hash": post_kmeans_codebook_hash,
+        "initial_batch_indices_hash": initial_batch_indices_hash,
+        "initial_batch_input_hash": initial_batch_input_hash,
+        "rng_at_training_start_hash": rng_at_training_start_hash,
+        "epoch_plan_rolling_hash": epoch_plan_rolling_hash,
+    }
+
+
+def save_common_initialization(
+    path: Path,
+    *,
+    initial_model_state,
+    post_kmeans_model_state,
+    rng_before_model_initialization,
+    rng_at_training_start,
+    initial_batch_indices,
+    initial_batch_inputs,
+    initial_batch_used_code_counts,
+    dataset_sha256,
+    dataset_item_count,
+    seed,
+    initialization_config_payload,
+    epoch_hashes,
+    epoch_plan_rolling_hash,
+) -> dict:
+    destination = Path(path)
+    if type(dataset_sha256) is not str:
+        raise TypeError("dataset_sha256 must be a string")
+    dataset_item_count = _require_positive_int(
+        "dataset_item_count",
+        dataset_item_count,
+    )
+    if type(seed) is not int:
+        raise ValueError("seed must be an int")
+    if not isinstance(initial_batch_inputs, torch.Tensor):
+        raise TypeError("initial_batch_inputs must be a tensor")
+
+    initial_state = _clone_cpu_state_mapping(initial_model_state)
+    post_state = _clone_cpu_state_mapping(post_kmeans_model_state)
+    _validate_state_layouts(initial_state, post_state)
+    rng_before = _clone_rng_state(rng_before_model_initialization)
+    rng_training = _clone_rng_state(rng_at_training_start)
+    indices = torch.as_tensor(
+        initial_batch_indices,
+        dtype=torch.long,
+        device="cpu",
+    ).clone()
+    if indices.ndim != 1:
+        raise ValueError("initial_batch_indices must be one-dimensional")
+    inputs = initial_batch_inputs.detach().to(device="cpu").clone()
+    used_code_counts = _normalize_used_code_counts(
+        initial_batch_used_code_counts
+    )
+    codebook_state = _post_kmeans_codebook_state(post_state)
+    if len(used_code_counts) != len(codebook_state):
+        raise ValueError("used code counts must match the number of codebooks")
+    normalized_epoch_hashes = _normalize_epoch_hashes(epoch_hashes)
+    deterministic_epoch_hashes = epoch_plan_hashes(
+        dataset_item_count,
+        seed,
+        500,
+    )
+    if normalized_epoch_hashes != deterministic_epoch_hashes:
+        raise ValueError("epoch hashes do not match the deterministic epoch plan")
+    calculated_rolling_hash = hash_json(normalized_epoch_hashes)
+    if calculated_rolling_hash != epoch_plan_rolling_hash:
+        raise ValueError("epoch plan rolling hash mismatch")
+
+    config_payload = copy.deepcopy(initialization_config_payload)
+    config_hash = hash_json(config_payload)
+    initial_model_hash = hash_state_dict(initial_state)
+    post_model_hash = hash_state_dict(post_state)
+    codebook_hash = _hash_codebook_state(post_state)
+    rng_before_hash = hash_rng_state(rng_before)
+    rng_training_hash = hash_rng_state(rng_training)
+    indices_hash = hash_tensor(indices)
+    input_hash = hash_tensor(inputs)
+    compatibility = _compatibility_payload(
+        dataset_sha256=dataset_sha256,
+        dataset_item_count=dataset_item_count,
+        seed=seed,
+        initialization_config_hash_value=config_hash,
+        initial_model_hash=initial_model_hash,
+        post_kmeans_model_hash=post_model_hash,
+        post_kmeans_codebook_hash=codebook_hash,
+        initial_batch_indices_hash=indices_hash,
+        initial_batch_input_hash=input_hash,
+        rng_at_training_start_hash=rng_training_hash,
+        epoch_plan_rolling_hash=calculated_rolling_hash,
+    )
+    artifact = {
+        "schema_version": 1,
+        "artifact_kind": "rqvae_common_initialization",
+        "dataset": {
+            "name": "amazon-beauty",
+            "item_count": dataset_item_count,
+            "sha256": dataset_sha256,
+        },
+        "seed": seed,
+        "initialization_config": config_payload,
+        "initialization_config_hash": config_hash,
+        "initial_model_state": initial_state,
+        "initial_model_hash": initial_model_hash,
+        "post_kmeans_model_state": post_state,
+        "post_kmeans_model_hash": post_model_hash,
+        "post_kmeans_codebook_hash": codebook_hash,
+        "rng_before_model_initialization": rng_before,
+        "rng_before_model_initialization_hash": rng_before_hash,
+        "rng_at_training_start": rng_training,
+        "rng_at_training_start_hash": rng_training_hash,
+        "initial_batch": {
+            "indices": indices,
+            "indices_hash": indices_hash,
+            "input_tensor_hash": input_hash,
+            "used_code_counts": used_code_counts,
+        },
+        "epoch_plan_hashes": normalized_epoch_hashes,
+        "epoch_plan_rolling_hash": calculated_rolling_hash,
+        "compatibility": compatibility,
+        "common_initialization_hash": hash_json(compatibility),
+    }
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(artifact, temporary_path)
+        os.link(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return artifact
+
+
+def _require_exact_fields(
+    payload: Mapping[str, object],
+    expected_fields: frozenset[str],
+    label: str,
+) -> None:
+    if set(payload) != expected_fields:
+        raise ValueError(f"{label} has an invalid schema")
+
+
+def _require_equal(label: str, actual: object, expected: object) -> None:
+    if actual != expected:
+        raise ValueError(f"{label} mismatch")
+
+
+def _validate_model_load_target(
+    model: nn.Module,
+    initial_state: Mapping[str, torch.Tensor],
+    post_state: Mapping[str, torch.Tensor],
+    initial_model_hash: str,
+) -> None:
+    current_state = clone_cpu_state_dict(model)
+    _validate_state_layouts(current_state, post_state)
+    if hash_state_dict(current_state) != initial_model_hash:
+        raise ValueError("model does not match the common initial model hash")
+    if set(current_state) != set(initial_state):
+        raise ValueError("model state keys do not match the stored initial state")
+    layers = getattr(model, "layers", None)
+    if layers is None or any(
+        not hasattr(layer, "kmeans_initted") for layer in layers
+    ):
+        raise ValueError("model does not expose RQ-VAE kmeans flags")
+
+
+def load_common_initialization(
+    path: Path,
+    *,
+    model,
+    expected_dataset_sha256,
+    expected_dataset_item_count,
+    expected_seed,
+    expected_initialization_config_hash,
+    expected_epoch_plan_rolling_hash,
+) -> dict:
+    artifact = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(artifact, Mapping):
+        raise ValueError("common initialization artifact must be a mapping")
+    _require_exact_fields(
+        artifact,
+        _COMMON_ARTIFACT_FIELDS,
+        "common initialization artifact",
+    )
+    _require_equal("schema version", artifact["schema_version"], 1)
+    _require_equal(
+        "artifact kind",
+        artifact["artifact_kind"],
+        "rqvae_common_initialization",
+    )
+
+    dataset = artifact["dataset"]
+    if not isinstance(dataset, Mapping) or set(dataset) != {
+        "name",
+        "item_count",
+        "sha256",
+    }:
+        raise ValueError("dataset metadata has an invalid schema")
+    _require_equal("dataset name", dataset["name"], "amazon-beauty")
+    _require_equal(
+        "dataset SHA-256",
+        dataset["sha256"],
+        expected_dataset_sha256,
+    )
+    _require_equal(
+        "dataset item count",
+        dataset["item_count"],
+        expected_dataset_item_count,
+    )
+    _require_equal("seed", artifact["seed"], expected_seed)
+
+    initial_state = _clone_cpu_state_mapping(artifact["initial_model_state"])
+    post_state = _clone_cpu_state_mapping(artifact["post_kmeans_model_state"])
+    _validate_state_layouts(initial_state, post_state)
+    calculated_initial_model_hash = hash_state_dict(initial_state)
+    calculated_post_model_hash = hash_state_dict(post_state)
+    calculated_codebook_hash = _hash_codebook_state(post_state)
+    _require_equal(
+        "initial model hash",
+        artifact["initial_model_hash"],
+        calculated_initial_model_hash,
+    )
+    _require_equal(
+        "post-kmeans model hash",
+        artifact["post_kmeans_model_hash"],
+        calculated_post_model_hash,
+    )
+    _require_equal(
+        "post-kmeans codebook hash",
+        artifact["post_kmeans_codebook_hash"],
+        calculated_codebook_hash,
+    )
+
+    config_hash = hash_json(artifact["initialization_config"])
+    _require_equal(
+        "initialization config hash",
+        artifact["initialization_config_hash"],
+        config_hash,
+    )
+    _require_equal(
+        "expected initialization config hash",
+        config_hash,
+        expected_initialization_config_hash,
+    )
+
+    rng_before = _clone_rng_state(artifact["rng_before_model_initialization"])
+    rng_training = _clone_rng_state(artifact["rng_at_training_start"])
+    calculated_rng_before_hash = hash_rng_state(rng_before)
+    calculated_rng_training_hash = hash_rng_state(rng_training)
+    _require_equal(
+        "pre-initialization RNG hash",
+        artifact["rng_before_model_initialization_hash"],
+        calculated_rng_before_hash,
+    )
+    _require_equal(
+        "training-start RNG hash",
+        artifact["rng_at_training_start_hash"],
+        calculated_rng_training_hash,
+    )
+
+    initial_batch = artifact["initial_batch"]
+    if not isinstance(initial_batch, Mapping):
+        raise ValueError("initial batch must be a mapping")
+    _require_exact_fields(
+        initial_batch,
+        frozenset(
+            {
+                "indices",
+                "indices_hash",
+                "input_tensor_hash",
+                "used_code_counts",
+            }
+        ),
+        "initial batch",
+    )
+    if not isinstance(initial_batch["indices"], torch.Tensor):
+        raise TypeError("initial batch indices must be a tensor")
+    calculated_indices_hash = hash_tensor(initial_batch["indices"])
+    _require_equal(
+        "initial batch indices hash",
+        initial_batch["indices_hash"],
+        calculated_indices_hash,
+    )
+    if type(initial_batch["input_tensor_hash"]) is not str:
+        raise TypeError("initial batch input hash must be a string")
+    _normalize_used_code_counts(initial_batch["used_code_counts"])
+
+    normalized_epoch_hashes = _normalize_epoch_hashes(
+        artifact["epoch_plan_hashes"]
+    )
+    deterministic_epoch_hashes = epoch_plan_hashes(
+        dataset["item_count"],
+        artifact["seed"],
+        500,
+    )
+    if normalized_epoch_hashes != deterministic_epoch_hashes:
+        raise ValueError("epoch hashes do not match the deterministic epoch plan")
+    calculated_epoch_rolling_hash = hash_json(normalized_epoch_hashes)
+    _require_equal(
+        "epoch plan rolling hash",
+        artifact["epoch_plan_rolling_hash"],
+        calculated_epoch_rolling_hash,
+    )
+    _require_equal(
+        "expected epoch plan rolling hash",
+        calculated_epoch_rolling_hash,
+        expected_epoch_plan_rolling_hash,
+    )
+
+    compatibility = artifact["compatibility"]
+    if not isinstance(compatibility, Mapping):
+        raise ValueError("compatibility payload must be a mapping")
+    _require_exact_fields(
+        compatibility,
+        _COMPATIBILITY_FIELDS,
+        "compatibility payload",
+    )
+    expected_compatibility = _compatibility_payload(
+        dataset_sha256=dataset["sha256"],
+        dataset_item_count=dataset["item_count"],
+        seed=artifact["seed"],
+        initialization_config_hash_value=config_hash,
+        initial_model_hash=calculated_initial_model_hash,
+        post_kmeans_model_hash=calculated_post_model_hash,
+        post_kmeans_codebook_hash=calculated_codebook_hash,
+        initial_batch_indices_hash=calculated_indices_hash,
+        initial_batch_input_hash=initial_batch["input_tensor_hash"],
+        rng_at_training_start_hash=calculated_rng_training_hash,
+        epoch_plan_rolling_hash=calculated_epoch_rolling_hash,
+    )
+    _require_equal(
+        "compatibility payload",
+        dict(compatibility),
+        expected_compatibility,
+    )
+    _require_equal(
+        "common initialization hash",
+        artifact["common_initialization_hash"],
+        hash_json(expected_compatibility),
+    )
+
+    _validate_model_load_target(
+        model,
+        initial_state,
+        post_state,
+        calculated_initial_model_hash,
+    )
+
+    model.load_state_dict(post_state, strict=True)
+    for layer in model.layers:
+        layer.kmeans_initted = True
+    restore_rng_state(rng_training)
+    return dict(artifact)

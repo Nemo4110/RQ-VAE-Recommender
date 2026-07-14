@@ -1,12 +1,18 @@
+import random
 from dataclasses import FrozenInstanceError
 from dataclasses import asdict
 from hashlib import sha256
+from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
+from torch.utils.data import TensorDataset
 
 import rqvae_collapse_diagnostics as diagnostics
+from modules.quantize import QuantizeForwardMode
+from modules.rqvae import RqVae
 from rqvae_collapse_diagnostics import (
     OptimizerSpec,
     build_diagnostic_optimizer,
@@ -414,3 +420,430 @@ def test_initialization_config_rejects_each_missing_field(
 
     with pytest.raises(ValueError, match=missing_field):
         initialization_config(config)
+
+
+def build_tiny_rqvae() -> RqVae:
+    return RqVae(
+        input_dim=8,
+        embed_dim=4,
+        hidden_dims=[6],
+        codebook_size=256,
+        codebook_kmeans_init=True,
+        codebook_mode=QuantizeForwardMode.STE,
+        n_layers=3,
+        commitment_weight=0.25,
+        n_cat_features=0,
+    )
+
+
+def test_tensor_and_nested_state_hashes_are_typed_and_deterministic() -> None:
+    contiguous = torch.arange(12, dtype=torch.int64).reshape(3, 4)
+    same_values_noncontiguous = contiguous.T.contiguous().T
+
+    expected_tensor_digest = sha256()
+    expected_tensor_digest.update(str(contiguous.dtype).encode("ascii"))
+    expected_tensor_digest.update(str(tuple(contiguous.shape)).encode("ascii"))
+    expected_tensor_digest.update(contiguous.numpy().tobytes())
+    assert diagnostics.hash_tensor(contiguous) == expected_tensor_digest.hexdigest()
+    assert diagnostics.hash_tensor(contiguous) == diagnostics.hash_tensor(
+        same_values_noncontiguous
+    )
+    assert diagnostics.hash_tensor(contiguous) != diagnostics.hash_tensor(
+        contiguous.reshape(2, 6)
+    )
+    assert diagnostics.hash_tensor(contiguous) != diagnostics.hash_tensor(
+        contiguous.to(torch.float64)
+    )
+
+    first = {
+        "z": [Path("artifact.pt"), np.arange(6, dtype=np.int16).reshape(2, 3)],
+        "a": (None, True, 7, 1.25, "value", contiguous),
+    }
+    second = {"a": first["a"], "z": first["z"]}
+    assert diagnostics.hash_nested_state(first) == diagnostics.hash_nested_state(
+        second
+    )
+    assert diagnostics.hash_nested_state(first) != diagnostics.hash_nested_state(
+        {"a": list(first["a"]), "z": first["z"]}
+    )
+
+
+def test_seed_capture_restore_and_rng_hash_cover_exact_rng_schema() -> None:
+    diagnostics.seed_all(20260701)
+    state = diagnostics.capture_rng_state()
+
+    assert set(state) == {"python", "numpy", "torch_cpu", "torch_cuda"}
+    assert isinstance(state["numpy"], tuple)
+    assert isinstance(state["torch_cpu"], torch.Tensor)
+    assert isinstance(state["torch_cuda"], list)
+    assert all(isinstance(value, torch.Tensor) for value in state["torch_cuda"])
+
+    expected = (random.random(), float(np.random.random()), torch.rand(4))
+    diagnostics.restore_rng_state(state)
+    observed = (random.random(), float(np.random.random()), torch.rand(4))
+
+    assert observed[:2] == expected[:2]
+    assert torch.equal(observed[2], expected[2])
+    assert diagnostics.hash_rng_state(state) == diagnostics.hash_nested_state(state)
+
+
+def test_load_items_by_index_preserves_requested_order() -> None:
+    item_tensor = torch.arange(80, dtype=torch.float32).reshape(10, 8)
+    dataset = TensorDataset(item_tensor)
+    indices = torch.tensor([7, 1, 9, 1], dtype=torch.long)
+
+    assert torch.equal(
+        diagnostics.load_items_by_index(dataset, indices),
+        item_tensor[indices],
+    )
+
+
+def test_clone_and_hash_state_dict_are_cpu_snapshots() -> None:
+    model = nn.Linear(3, 2)
+    snapshot = diagnostics.clone_cpu_state_dict(model)
+    snapshot_hash = diagnostics.hash_state_dict(snapshot)
+    expected_state_digest = sha256()
+    for name, tensor in sorted(snapshot.items()):
+        expected_state_digest.update(name.encode("utf-8"))
+        expected_state_digest.update(
+            diagnostics.hash_tensor(tensor).encode("ascii")
+        )
+
+    assert snapshot_hash == expected_state_digest.hexdigest()
+    assert all(value.device.type == "cpu" for value in snapshot.values())
+    with torch.no_grad():
+        model.weight.add_(1)
+    assert snapshot_hash == diagnostics.hash_state_dict(snapshot)
+    assert snapshot_hash != diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(model)
+    )
+
+
+def test_epoch_permutations_and_500_epoch_plan_have_fixed_hashes() -> None:
+    epoch_one = diagnostics.epoch_permutation(12101, 20260701, 1)
+    epoch_two = diagnostics.epoch_permutation(12101, 20260701, 2)
+    reference = torch.randperm(
+        12101,
+        generator=torch.Generator().manual_seed(20260701),
+    )
+
+    assert torch.equal(epoch_one, reference)
+    assert torch.equal(
+        diagnostics.epoch_permutation(12101, 20260701, 1),
+        reference,
+    )
+    assert not torch.equal(epoch_one, epoch_two)
+    assert epoch_one[:10].tolist() == [
+        5789,
+        7976,
+        1954,
+        61,
+        4956,
+        6279,
+        8367,
+        9758,
+        10931,
+        11451,
+    ]
+    assert diagnostics.hash_tensor(epoch_one) == (
+        "8907d569cce451f348f62fac9bc20acab7197642b88d65afc80c91c0e031eb5d"
+    )
+    assert diagnostics.hash_tensor(epoch_two) == (
+        "80221b13579551f7563d8c84ab9680bca94be2b592419988f8096f43b559d50b"
+    )
+
+    epoch_hashes = diagnostics.epoch_plan_hashes(12101, 20260701, 500)
+    assert len(epoch_hashes) == 500
+    assert epoch_hashes[:2] == [
+        "8907d569cce451f348f62fac9bc20acab7197642b88d65afc80c91c0e031eb5d",
+        "80221b13579551f7563d8c84ab9680bca94be2b592419988f8096f43b559d50b",
+    ]
+    assert diagnostics.rolling_epoch_plan_hash(12101, 20260701, 500) == (
+        "658100b51fb7833b8574188dec3c2901bf0fc7387ae4b58401a6f7202a70a9ac"
+    )
+
+
+@pytest.mark.parametrize(
+    ("call", "match"),
+    [
+        (lambda: diagnostics.epoch_permutation(0, 7, 1), "item_count"),
+        (lambda: diagnostics.epoch_permutation(10, 7, 0), "epoch"),
+        (lambda: diagnostics.epoch_plan_hashes(10, 7, 0), "epochs"),
+        (lambda: diagnostics.rolling_epoch_plan_hash(10, 7, 0), "epochs"),
+    ],
+)
+def test_epoch_plan_rejects_nonpositive_dimensions(call, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        call()
+
+
+def test_common_initialization_round_trip_validation_and_exclusive_publish(
+    tmp_path: Path,
+) -> None:
+    seed = 20260701
+    dataset_sha256 = "a" * 64
+    dataset_item_count = 12101
+    initialization_payload = initialization_config(
+        diagnostic_config(
+            dataset_sha256=dataset_sha256,
+            dataset_item_count=dataset_item_count,
+            vae_input_dim=8,
+            vae_hidden_dims=[6],
+            vae_embed_dim=4,
+        )
+    )
+
+    diagnostics.seed_all(seed)
+    rng_before_model_initialization = diagnostics.capture_rng_state()
+    model = build_tiny_rqvae()
+    initial_model_state = diagnostics.clone_cpu_state_dict(model)
+    initial_batch_indices = torch.arange(1024, dtype=torch.long)
+    initial_batch_inputs = (
+        torch.arange(1024 * 8, dtype=torch.float32).reshape(1024, 8) / 1024
+    )
+    semantic_ids = model.get_semantic_ids(initial_batch_inputs).sem_ids
+    assert all(layer.kmeans_initted for layer in model.layers)
+    initial_batch_used_code_counts = [
+        int(semantic_ids[:, index].unique().numel())
+        for index in range(semantic_ids.shape[1])
+    ]
+    post_kmeans_model_state = diagnostics.clone_cpu_state_dict(model)
+    rng_at_training_start = diagnostics.capture_rng_state()
+    epoch_hashes = diagnostics.epoch_plan_hashes(dataset_item_count, seed, 500)
+    epoch_plan_rolling_hash = diagnostics.rolling_epoch_plan_hash(
+        dataset_item_count,
+        seed,
+        500,
+    )
+    path = tmp_path / "rqvae_common_initialization.pt"
+    save_kwargs = {
+        "initial_model_state": initial_model_state,
+        "post_kmeans_model_state": post_kmeans_model_state,
+        "rng_before_model_initialization": rng_before_model_initialization,
+        "rng_at_training_start": rng_at_training_start,
+        "initial_batch_indices": initial_batch_indices,
+        "initial_batch_inputs": initial_batch_inputs,
+        "initial_batch_used_code_counts": initial_batch_used_code_counts,
+        "dataset_sha256": dataset_sha256,
+        "dataset_item_count": dataset_item_count,
+        "seed": seed,
+        "initialization_config_payload": initialization_payload,
+        "epoch_hashes": epoch_hashes,
+        "epoch_plan_rolling_hash": epoch_plan_rolling_hash,
+    }
+
+    artifact = diagnostics.save_common_initialization(path, **save_kwargs)
+
+    assert path.is_file()
+    assert set(artifact) == {
+        "schema_version",
+        "artifact_kind",
+        "dataset",
+        "seed",
+        "initialization_config",
+        "initialization_config_hash",
+        "initial_model_state",
+        "initial_model_hash",
+        "post_kmeans_model_state",
+        "post_kmeans_model_hash",
+        "post_kmeans_codebook_hash",
+        "rng_before_model_initialization",
+        "rng_before_model_initialization_hash",
+        "rng_at_training_start",
+        "rng_at_training_start_hash",
+        "initial_batch",
+        "epoch_plan_hashes",
+        "epoch_plan_rolling_hash",
+        "compatibility",
+        "common_initialization_hash",
+    }
+    assert artifact["schema_version"] == 1
+    assert artifact["artifact_kind"] == "rqvae_common_initialization"
+    assert artifact["dataset"] == {
+        "name": "amazon-beauty",
+        "item_count": dataset_item_count,
+        "sha256": dataset_sha256,
+    }
+    assert artifact["initialization_config"] == initialization_payload
+    assert artifact["initialization_config_hash"] == hash_json(
+        initialization_payload
+    )
+    assert artifact["initial_model_hash"] == diagnostics.hash_state_dict(
+        initial_model_state
+    )
+    assert artifact["post_kmeans_model_hash"] == diagnostics.hash_state_dict(
+        post_kmeans_model_state
+    )
+    expected_codebook_hash = hash_json(
+        [
+            diagnostics.hash_tensor(value)
+            for key, value in sorted(post_kmeans_model_state.items())
+            if key.startswith("layers.") and key.endswith(".embedding.weight")
+        ]
+    )
+    assert artifact["post_kmeans_codebook_hash"] == expected_codebook_hash
+    assert artifact["rng_before_model_initialization_hash"] == (
+        diagnostics.hash_rng_state(rng_before_model_initialization)
+    )
+    assert artifact["rng_at_training_start_hash"] == diagnostics.hash_rng_state(
+        rng_at_training_start
+    )
+    assert set(artifact["initial_batch"]) == {
+        "indices",
+        "indices_hash",
+        "input_tensor_hash",
+        "used_code_counts",
+    }
+    assert torch.equal(
+        artifact["initial_batch"]["indices"],
+        initial_batch_indices,
+    )
+    assert artifact["initial_batch"]["indices_hash"] == diagnostics.hash_tensor(
+        initial_batch_indices
+    )
+    assert artifact["initial_batch"]["input_tensor_hash"] == diagnostics.hash_tensor(
+        initial_batch_inputs
+    )
+    assert artifact["initial_batch"]["used_code_counts"] == (
+        initial_batch_used_code_counts
+    )
+    assert artifact["epoch_plan_hashes"] == epoch_hashes
+    assert len(artifact["epoch_plan_hashes"]) == 500
+    assert artifact["epoch_plan_rolling_hash"] == epoch_plan_rolling_hash
+
+    expected_compatibility = {
+        "dataset_sha256": dataset_sha256,
+        "dataset_item_count": dataset_item_count,
+        "seed": seed,
+        "initialization_config_hash": artifact["initialization_config_hash"],
+        "initial_model_hash": artifact["initial_model_hash"],
+        "post_kmeans_model_hash": artifact["post_kmeans_model_hash"],
+        "post_kmeans_codebook_hash": artifact["post_kmeans_codebook_hash"],
+        "initial_batch_indices_hash": artifact["initial_batch"]["indices_hash"],
+        "initial_batch_input_hash": artifact["initial_batch"]["input_tensor_hash"],
+        "rng_at_training_start_hash": artifact["rng_at_training_start_hash"],
+        "epoch_plan_rolling_hash": epoch_plan_rolling_hash,
+    }
+    assert artifact["compatibility"] == expected_compatibility
+    assert artifact["common_initialization_hash"] == hash_json(
+        expected_compatibility
+    )
+
+    forged_epoch_hashes = list(epoch_hashes)
+    forged_epoch_hashes[0] = "0" * 64
+    forged_rolling_hash = hash_json(forged_epoch_hashes)
+    forged_save_kwargs = {
+        **save_kwargs,
+        "epoch_hashes": forged_epoch_hashes,
+        "epoch_plan_rolling_hash": forged_rolling_hash,
+    }
+    with pytest.raises(ValueError, match="deterministic epoch plan"):
+        diagnostics.save_common_initialization(
+            tmp_path / "forged_save.pt",
+            **forged_save_kwargs,
+        )
+
+    published_bytes = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        diagnostics.save_common_initialization(path, **save_kwargs)
+    assert path.read_bytes() == published_bytes
+    assert list(tmp_path.iterdir()) == [path]
+
+    diagnostics.restore_rng_state(rng_before_model_initialization)
+    fresh_model = build_tiny_rqvae()
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(fresh_model)
+    ) == artifact["initial_model_hash"]
+    random.random()
+    np.random.random()
+    torch.rand(3)
+
+    loaded = diagnostics.load_common_initialization(
+        path,
+        model=fresh_model,
+        expected_dataset_sha256=dataset_sha256,
+        expected_dataset_item_count=dataset_item_count,
+        expected_seed=seed,
+        expected_initialization_config_hash=artifact[
+            "initialization_config_hash"
+        ],
+        expected_epoch_plan_rolling_hash=epoch_plan_rolling_hash,
+    )
+
+    assert loaded["common_initialization_hash"] == artifact[
+        "common_initialization_hash"
+    ]
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(fresh_model)
+    ) == artifact["post_kmeans_model_hash"]
+    assert all(layer.kmeans_initted for layer in fresh_model.layers)
+    assert diagnostics.hash_rng_state(diagnostics.capture_rng_state()) == artifact[
+        "rng_at_training_start_hash"
+    ]
+
+    forged = torch.load(path, map_location="cpu", weights_only=False)
+    forged["epoch_plan_hashes"] = forged_epoch_hashes
+    forged["epoch_plan_rolling_hash"] = forged_rolling_hash
+    forged["compatibility"]["epoch_plan_rolling_hash"] = forged_rolling_hash
+    forged["common_initialization_hash"] = hash_json(forged["compatibility"])
+    forged_path = tmp_path / "forged_load.pt"
+    torch.save(forged, forged_path)
+    diagnostics.restore_rng_state(rng_before_model_initialization)
+    forged_model = build_tiny_rqvae()
+    forged_model_hash = diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(forged_model)
+    )
+    forged_rng_hash = diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    )
+    with pytest.raises(ValueError, match="deterministic epoch plan"):
+        diagnostics.load_common_initialization(
+            forged_path,
+            model=forged_model,
+            expected_dataset_sha256=dataset_sha256,
+            expected_dataset_item_count=dataset_item_count,
+            expected_seed=seed,
+            expected_initialization_config_hash=artifact[
+                "initialization_config_hash"
+            ],
+            expected_epoch_plan_rolling_hash=forged_rolling_hash,
+        )
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(forged_model)
+    ) == forged_model_hash
+    assert diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    ) == forged_rng_hash
+
+    tampered = torch.load(path, map_location="cpu", weights_only=False)
+    first_state_key = next(iter(tampered["post_kmeans_model_state"]))
+    tampered["post_kmeans_model_state"][first_state_key].add_(1)
+    tampered_path = tmp_path / "tampered.pt"
+    torch.save(tampered, tampered_path)
+
+    diagnostics.restore_rng_state(rng_before_model_initialization)
+    untouched_model = build_tiny_rqvae()
+    untouched_model_hash = diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(untouched_model)
+    )
+    untouched_rng_hash = diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    )
+    with pytest.raises(ValueError, match="post-kmeans model hash"):
+        diagnostics.load_common_initialization(
+            tampered_path,
+            model=untouched_model,
+            expected_dataset_sha256=dataset_sha256,
+            expected_dataset_item_count=dataset_item_count,
+            expected_seed=seed,
+            expected_initialization_config_hash=artifact[
+                "initialization_config_hash"
+            ],
+            expected_epoch_plan_rolling_hash=epoch_plan_rolling_hash,
+        )
+    assert diagnostics.hash_state_dict(
+        diagnostics.clone_cpu_state_dict(untouched_model)
+    ) == untouched_model_hash
+    assert diagnostics.hash_rng_state(
+        diagnostics.capture_rng_state()
+    ) == untouched_rng_hash
