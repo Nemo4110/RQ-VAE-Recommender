@@ -310,9 +310,15 @@ def train(
                 last_snapshot = append_snapshot(f"optimizer_step:{optimizer_step}", None)
                 ever_hard_collapse |= bool(last_snapshot["hard_collapse"])
         epoch_losses = {key: value / batches for key, value in totals.items()}
-        if epoch in _SNAPSHOT_EPOCHS or epoch == epochs:
+        if epoch in _SNAPSHOT_EPOCHS or epoch % 500 == 0 or epoch == epochs:
             last_snapshot = append_snapshot(f"epoch:{epoch}", epoch)
             ever_hard_collapse |= bool(last_snapshot["hard_collapse"])
+        if epoch % 2000 == 0 or epoch == epochs:
+            torch.save(
+                {"model": model.state_dict(), "completed_epoch": epoch,
+                 "optimizer_step": optimizer_step, "config": config_payload},
+                save_root / f"checkpoint_epoch_{epoch:05d}_step_{optimizer_step:07d}.pt",
+            )
         if epoch % 50 == 0:
             print(json.dumps({"arm": arm_name, "epoch": epoch,
                               "losses": epoch_losses,
