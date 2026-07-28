@@ -3,13 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data.schemas import TokenizedSeqBatch
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Sequence
 from torch import Tensor
 from transformers import T5EncoderModel
 from transformers.models.t5.modeling_t5 import T5Config, T5Stack
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 torch.set_float32_matmul_precision("high")
+
+
+def build_valid_prefix_index(codebooks: torch.Tensor):
+    prefix_index = []
+    code_tuples = [tuple(int(token) for token in code) for code in codebooks.tolist()]
+    for hierarchy in range(codebooks.shape[1]):
+        allowed_next = {}
+        for code in code_tuples:
+            prefix = code[:hierarchy]
+            allowed_next.setdefault(prefix, set()).add(code[hierarchy])
+        prefix_index.append(
+            {
+                prefix: torch.tensor(sorted(tokens), dtype=torch.long)
+                for prefix, tokens in allowed_next.items()
+            }
+        )
+    return prefix_index
 
 
 class ModelOutput(NamedTuple):
@@ -23,34 +40,12 @@ class GenerationOutput(NamedTuple):
     log_probas: Tensor
 
 
-def _strip_dedup_col(
-    tensor: torch.Tensor, sem_ids_dim: int, n_layers: int
-) -> torch.Tensor:
-    """Strip the deduplication column appended by SemanticIdTokenizer.
-
-    Args:
-        tensor:      [B, N * sem_ids_dim]  where sem_ids_dim = n_layers + 1
-        sem_ids_dim: tokens per item including the dedup column
-        n_layers:    number of RQ-VAE codebook levels
-
-    Returns:
-        [B, N * n_layers]
-    """
-    B, total = tensor.shape
-    N = total // sem_ids_dim
-    return (
-        tensor.view(B, N, sem_ids_dim)[:, :, :n_layers]
-        .contiguous()
-        .view(B, N * n_layers)
-    )
-
-
 class EncoderDecoderRetrievalModel(nn.Module):
     """HuggingFace T5 encoder-decoder for sequential recommendation.
 
     Uses T5EncoderModel for encoding and T5Stack for decoding. Per-hierarchy
     linear output heads project decoder hidden states to codebook logits.
-    Beam search uses multinomial sampling with log-probability accumulation
+    Beam search uses deterministic top-k expansion with log-probability accumulation
     and a float("-inf") mask for invalid SID prefixes.
     """
 
@@ -59,6 +54,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
         codebooks: torch.Tensor,
         num_hierarchies: int,
         num_embeddings_per_hierarchy: int,
+        token_cardinalities: Optional[Sequence[int]] = None,
         t5_d_model: int = 128,
         t5_num_heads: int = 6,
         t5_d_ff: int = 1024,
@@ -71,11 +67,35 @@ class EncoderDecoderRetrievalModel(nn.Module):
 
         self.num_hierarchies = num_hierarchies
         self.num_embeddings_per_hierarchy = num_embeddings_per_hierarchy
+        self.token_cardinalities = tuple(
+            int(cardinality)
+            for cardinality in (
+                token_cardinalities
+                if token_cardinalities is not None
+                else [num_embeddings_per_hierarchy] * num_hierarchies
+            )
+        )
+        if len(self.token_cardinalities) != num_hierarchies:
+            raise ValueError("token_cardinalities must match num_hierarchies")
+        if any(cardinality <= 0 for cardinality in self.token_cardinalities):
+            raise ValueError("token cardinalities must be positive")
+        cardinalities = torch.tensor(self.token_cardinalities, dtype=torch.long)
+        token_type_offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.long), torch.cumsum(cardinalities[:-1], dim=0)]
+        )
+        self.register_buffer("token_type_offsets", token_type_offsets)
+        valid_tuple_count = torch.unique(codebooks, dim=0).shape[0]
+        if not 1 <= top_k_for_generation <= valid_tuple_count:
+            raise ValueError(
+                "top_k_for_generation must not exceed valid corpus tuples"
+            )
         self.top_k_for_generation = top_k_for_generation
         self.register_buffer("codebooks", codebooks)
+        self.valid_prefix_index = build_valid_prefix_index(codebooks)
+        self.last_generation_max_expansion_score_elements = 0
 
         encoder_config = T5Config(
-            vocab_size=num_embeddings_per_hierarchy * num_hierarchies,
+            vocab_size=sum(self.token_cardinalities),
             d_model=t5_d_model,
             num_heads=t5_num_heads,
             d_ff=t5_d_ff,
@@ -85,7 +105,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
         self.encoder = T5EncoderModel(encoder_config)
 
         decoder_config = T5Config(
-            vocab_size=num_embeddings_per_hierarchy * num_hierarchies,
+            vocab_size=sum(self.token_cardinalities),
             d_model=t5_d_model,
             num_heads=t5_num_heads,
             d_ff=t5_d_ff,
@@ -97,14 +117,14 @@ class EncoderDecoderRetrievalModel(nn.Module):
         self.bos_token = nn.Parameter(torch.randn(1, t5_d_model), requires_grad=True)
         self.decoder_mlp = nn.ModuleList(
             [
-                nn.Linear(t5_d_model, num_embeddings_per_hierarchy, bias=False)
-                for _ in range(num_hierarchies)
+                nn.Linear(t5_d_model, cardinality, bias=False)
+                for cardinality in self.token_cardinalities
             ]
         )
 
-        # Shared embedding table; hierarchy h, token t maps to index h * codebook_size + t.
+        # Shared embedding table uses cumulative offsets for variable token cardinalities.
         self.item_sid_embedding_table = nn.Embedding(
-            num_embeddings=num_embeddings_per_hierarchy * num_hierarchies,
+            num_embeddings=sum(self.token_cardinalities),
             embedding_dim=t5_d_model,
         )
 
@@ -129,7 +149,6 @@ class EncoderDecoderRetrievalModel(nn.Module):
     def _add_repeating_offset_to_rows(
         self,
         input_sids: torch.Tensor,
-        codebook_size: int,
         num_hierarchies: int,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -137,9 +156,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
         if input_sids.ndim != 2:
             raise ValueError("Input tensor must be 2-dimensional.")
         _, num_cols = input_sids.shape
-        offsets = (
-            torch.arange(num_hierarchies, device=input_sids.device) * codebook_size
-        )
+        offsets = self.token_type_offsets.to(input_sids.device)
         num_repeats = (num_cols + num_hierarchies - 1) // num_hierarchies
         repeated_offsets = offsets.repeat(num_repeats)[:num_cols]
         result = input_sids + repeated_offsets
@@ -184,7 +201,6 @@ class EncoderDecoderRetrievalModel(nn.Module):
     def encoder_forward_pass(self, attention_mask, input_ids, user_id=None):
         shifted = self._add_repeating_offset_to_rows(
             input_sids=input_ids,
-            codebook_size=self.num_embeddings_per_hierarchy,
             num_hierarchies=self.num_hierarchies,
             attention_mask=attention_mask,
         )
@@ -229,7 +245,6 @@ class EncoderDecoderRetrievalModel(nn.Module):
         if future_ids is not None:
             shifted = self._add_repeating_offset_to_rows(
                 input_sids=future_ids,
-                codebook_size=self.num_embeddings_per_hierarchy,
                 num_hierarchies=self.num_hierarchies,
                 attention_mask=torch.ones_like(future_ids)
                 if attention_mask is None
@@ -268,12 +283,9 @@ class EncoderDecoderRetrievalModel(nn.Module):
         return out.last_hidden_state
 
     def forward(self, batch: TokenizedSeqBatch) -> ModelOutput:
-        sem_ids_dim = self.num_hierarchies + 1
-        input_ids = _strip_dedup_col(batch.sem_ids, sem_ids_dim, self.num_hierarchies)
-        attention_mask = _strip_dedup_col(
-            batch.seq_mask.long(), sem_ids_dim, self.num_hierarchies
-        )
-        fut_ids = batch.sem_ids_fut[:, : self.num_hierarchies]
+        input_ids = batch.sem_ids
+        attention_mask = batch.seq_mask.long()
+        fut_ids = batch.sem_ids_fut
 
         encoder_output, attention_mask_for_encoder = self.encoder_forward_pass(
             attention_mask=attention_mask,
@@ -297,96 +309,157 @@ class EncoderDecoderRetrievalModel(nn.Module):
 
         return ModelOutput(loss=total_loss, logits=None, loss_d=torch.stack(loss_d))
 
+    def _select_valid_expansions(
+        self,
+        probabilities,
+        beam_prefixes,
+        log_probas,
+        hierarchy,
+    ):
+        batch_size = len(beam_prefixes)
+        beam_count = len(beam_prefixes[0])
+        probabilities = probabilities.reshape(
+            batch_size, beam_count, probabilities.shape[-1]
+        )
+        batch_candidates = []
+        min_candidate_count = None
+
+        for batch_index, prefixes in enumerate(beam_prefixes):
+            score_parts = []
+            token_parts = []
+            parent_parts = []
+            next_prefixes = []
+            for parent_index, prefix in enumerate(prefixes):
+                allowed_token_values = self.valid_prefix_index[hierarchy][prefix].tolist()
+                allowed_tokens = torch.tensor(
+                    allowed_token_values,
+                    dtype=torch.long,
+                    device=probabilities.device,
+                )
+                scores = torch.log(
+                    probabilities[batch_index, parent_index, allowed_tokens].clamp_min(
+                        1e-30
+                    )
+                )
+                if log_probas is not None:
+                    scores = scores + log_probas[batch_index, parent_index]
+                score_parts.append(scores)
+                token_parts.append(allowed_tokens)
+                parent_parts.append(
+                    torch.full_like(allowed_tokens, parent_index, dtype=torch.long)
+                )
+                next_prefixes.extend(
+                    prefix + (token,) for token in allowed_token_values
+                )
+
+            candidate_scores = torch.cat(score_parts)
+            candidate_tokens = torch.cat(token_parts)
+            parent_indices = torch.cat(parent_parts)
+            candidate_count = int(candidate_scores.numel())
+            self.last_generation_max_expansion_score_elements = max(
+                self.last_generation_max_expansion_score_elements,
+                candidate_count,
+            )
+            min_candidate_count = (
+                candidate_count
+                if min_candidate_count is None
+                else min(min_candidate_count, candidate_count)
+            )
+            batch_candidates.append(
+                (candidate_scores, candidate_tokens, parent_indices, next_prefixes)
+            )
+
+        keep_count = min(self.top_k_for_generation, min_candidate_count)
+        if keep_count == 0:
+            raise RuntimeError("no finite valid semantic ID continuations remain")
+
+        selected_scores = []
+        selected_tokens = []
+        selected_parents = []
+        selected_prefixes = []
+        for candidate_scores, candidate_tokens, parent_indices, next_prefixes in batch_candidates:
+            scores, indices = torch.topk(candidate_scores, k=keep_count, dim=0)
+            selected_scores.append(scores)
+            selected_tokens.append(candidate_tokens[indices])
+            selected_parents.append(parent_indices[indices])
+            selected_prefixes.append([next_prefixes[index] for index in indices.tolist()])
+
+        return (
+            torch.stack(selected_tokens),
+            torch.stack(selected_parents),
+            torch.stack(selected_scores),
+            selected_prefixes,
+        )
+
     @torch.no_grad()
     def generate(self, attention_mask, input_ids, user_id=None):
-        """Generate top-k semantic IDs using sampling-based beam search.
+        """Generate deterministic exact top-k valid semantic IDs."""
+        batch_size = input_ids.size(0)
+        self.last_generation_max_expansion_score_elements = 0
 
-        For each hierarchy level, samples n_candidates tokens via multinomial,
-        scores them using cumulative log-probabilities with a float("-inf") mask for
-        invalid SID prefixes, and keeps the top-k highest-scoring candidates.
-
-        Returns:
-            generated_ids: [B, top_k, num_hierarchies]
-            log_probas:    [B, top_k]
-        """
-        B = input_ids.size(0)
-        k = self.top_k_for_generation
-        n_cands = min(64, self.num_embeddings_per_hierarchy)
-
-        enc_out, enc_mask = self.encoder_forward_pass(
+        encoder_output, encoder_mask = self.encoder_forward_pass(
             attention_mask=attention_mask,
             input_ids=input_ids,
             user_id=user_id,
         )
-        rep_enc = enc_out.repeat_interleave(k, dim=0)
-        rep_mask = enc_mask.repeat_interleave(k, dim=0)
-
-        generated = None  # [B, k, h] grows with each hierarchy step
-        log_probas = 0
+        generated = None
+        log_probas = None
+        beam_prefixes = [[()] for _ in range(batch_size)]
         past_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
 
-        for h in range(self.num_hierarchies):
-            if generated is not None:
-                cur_enc, cur_mask = rep_enc, rep_mask
-                squeezed = generated.reshape(-1, h)
+        for hierarchy in range(self.num_hierarchies):
+            beam_count = len(beam_prefixes[0])
+            if generated is None:
+                current_encoder = encoder_output
+                current_mask = encoder_mask
+                decoder_ids = None
             else:
-                cur_enc, cur_mask = enc_out, enc_mask
-                squeezed = None
+                current_encoder = encoder_output.repeat_interleave(beam_count, dim=0)
+                current_mask = encoder_mask.repeat_interleave(beam_count, dim=0)
+                decoder_ids = generated.reshape(-1, hierarchy)
 
-            dec_out, past_kv = self.decoder_forward_pass(
-                future_ids=squeezed,
-                encoder_output=cur_enc,
-                attention_mask_for_encoder=cur_mask,
+            decoder_output, past_kv = self.decoder_forward_pass(
+                future_ids=decoder_ids,
+                encoder_output=current_encoder,
+                attention_mask_for_encoder=current_mask,
                 use_cache=True,
                 past_key_values=past_kv,
             )
-
-            probas = F.softmax(self.decoder_mlp[h](dec_out[:, -1, :]), dim=-1)
-            samples = torch.multinomial(probas, num_samples=n_cands)
-            samp_log_p = torch.log(torch.gather(probas, 1, samples))
+            probabilities = F.softmax(
+                self.decoder_mlp[hierarchy](decoder_output[:, -1, :]),
+                dim=-1,
+            )
+            (
+                new_tokens,
+                parent_beam_indices,
+                log_probas,
+                beam_prefixes,
+            ) = self._select_valid_expansions(
+                probabilities=probabilities,
+                beam_prefixes=beam_prefixes,
+                log_probas=log_probas,
+                hierarchy=hierarchy,
+            )
 
             if generated is None:
-                is_valid = self._check_valid_prefix(samples.reshape(-1, 1)).reshape(
-                    B, n_cands
-                )
-                scores, idx = samp_log_p.masked_fill(~is_valid, float("-inf")).sort(
-                    -1, descending=True
-                )
-                top_k_idx = idx[:, :k]
-                generated = torch.gather(samples, 1, top_k_idx).unsqueeze(
-                    -1
-                )  # [B, k, 1]
-                log_probas = scores[:, :k]
+                generated = new_tokens.unsqueeze(-1)
                 past_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
-            else:
-                prev = generated.reshape(-1, h).repeat_interleave(n_cands, dim=0)
-                prefix = torch.cat([prev, samples.reshape(-1, 1)], dim=1)
-                is_valid = self._check_valid_prefix(prefix).reshape(B, k * n_cands)
-                scores, idx = (
-                    (
-                        samp_log_p.reshape(B, k * n_cands)
-                        + log_probas.repeat_interleave(n_cands, dim=1)
-                    )
-                    .masked_fill(~is_valid, float("-inf"))
-                    .sort(-1, descending=True)
-                )
+                continue
 
-                top_k_idx = idx[:, :k]
-                parent_beam_idx = top_k_idx // n_cands
-                parent_global = (
-                    parent_beam_idx
-                    + torch.arange(B, device=parent_beam_idx.device).unsqueeze(1) * k
-                ).flatten()
-                past_kv.reorder_cache(parent_global)
-
-                parent_ids = torch.gather(
-                    generated, 1, parent_beam_idx.unsqueeze(-1).expand(-1, -1, h)
-                )
-                new_ids = torch.gather(
-                    samples.reshape(B, k * n_cands), 1, top_k_idx
-                ).unsqueeze(-1)
-                generated = torch.cat([parent_ids, new_ids], dim=-1)  # [B, k, h+1]
-                log_probas = scores[:, :k]
+            parent_global_indices = (
+                parent_beam_indices
+                + torch.arange(
+                    batch_size, device=parent_beam_indices.device
+                ).unsqueeze(1)
+                * beam_count
+            ).flatten()
+            past_kv.reorder_cache(parent_global_indices)
+            parent_ids = torch.gather(
+                generated,
+                1,
+                parent_beam_indices.unsqueeze(-1).expand(-1, -1, hierarchy),
+            )
+            generated = torch.cat([parent_ids, new_tokens.unsqueeze(-1)], dim=-1)
 
         return generated, log_probas
 
@@ -397,11 +470,8 @@ class EncoderDecoderRetrievalModel(nn.Module):
         top_k: bool = True,
         temperature: int = 1,
     ) -> GenerationOutput:
-        sem_ids_dim = self.num_hierarchies + 1
-        input_ids = _strip_dedup_col(batch.sem_ids, sem_ids_dim, self.num_hierarchies)
-        attention_mask = _strip_dedup_col(
-            batch.seq_mask.long(), sem_ids_dim, self.num_hierarchies
-        )
+        input_ids = batch.sem_ids
+        attention_mask = batch.seq_mask.long()
         generated_ids, log_probas = self.generate(
             attention_mask=attention_mask,
             input_ids=input_ids,

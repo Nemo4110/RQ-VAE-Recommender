@@ -1,3 +1,4 @@
+import math
 import os
 import gin
 import torch
@@ -10,7 +11,6 @@ from data.processed import SeqData
 from data.utils import batch_to
 from data.utils import cycle
 from data.utils import next_batch
-from evaluate.metrics import TopKAccumulator
 from modules.model import EncoderDecoderRetrievalModel
 from modules.scheduler.inv_sqrt import InverseSquareRootScheduler
 from modules.tokenizer.semids import SemanticIdTokenizer
@@ -22,11 +22,260 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def build_decoder_model(
+    tokenizer,
+    vae_codebook_size,
+    t5_d_model,
+    t5_num_heads,
+    t5_d_ff,
+    t5_num_layers,
+    top_k_for_generation,
+    should_add_sep_token,
+    num_user_bins,
+):
+    codebooks = tokenizer.cached_ids.cpu()
+    if codebooks.ndim != 2 or codebooks.shape[1] != tokenizer.sem_ids_dim:
+        raise ValueError("cached semantic IDs must match tokenizer.sem_ids_dim")
+    if tokenizer.sem_ids_dim != 4:
+        raise ValueError("TIGER decoder requires exactly four semantic ID tokens")
+    if torch.unique(codebooks, dim=0).shape[0] != codebooks.shape[0]:
+        raise ValueError("four-token semantic IDs must map one-to-one to items")
+    token_cardinalities = (
+        *([vae_codebook_size] * (tokenizer.sem_ids_dim - 1)),
+        int(codebooks[:, -1].max().item()) + 1,
+    )
+    model = EncoderDecoderRetrievalModel(
+        codebooks=codebooks,
+        num_hierarchies=tokenizer.sem_ids_dim,
+        num_embeddings_per_hierarchy=vae_codebook_size,
+        token_cardinalities=token_cardinalities,
+        t5_d_model=t5_d_model,
+        t5_num_heads=t5_num_heads,
+        t5_d_ff=t5_d_ff,
+        t5_num_layers=t5_num_layers,
+        top_k_for_generation=top_k_for_generation,
+        should_add_sep_token=should_add_sep_token,
+        num_user_bins=num_user_bins,
+    )
+    return model, codebooks, token_cardinalities
+
+
+def build_decoder_scheduler(optimizer, lr_warmup_steps):
+    return InverseSquareRootScheduler(
+        optimizer=optimizer,
+        warmup_steps=lr_warmup_steps,
+    )
+
+
+def get_full_eval_targets(tokenized_data):
+    return tokenized_data.sem_ids_fut
+
+
+METRIC_STATE_KEYS = (
+    "item_hr@5",
+    "item_hr@10",
+    "item_ndcg@5",
+    "item_ndcg@10",
+    "item_mrr@5",
+    "item_mrr@10",
+    "item_total",
+    "invalid_id_count",
+    "prediction_count",
+    "semantic_h@5",
+    "semantic_h@10",
+    "semantic_ndcg@10",
+    "semantic_total",
+)
+
+
+class ItemTopKAccumulator:
+    def __init__(self, codebooks, ks=(5, 10)):
+        if tuple(ks) != (5, 10):
+            raise ValueError("item metrics are fixed to cutoffs (5, 10)")
+        self.code_to_item = {
+            tuple(code): item_id for item_id, code in enumerate(codebooks.tolist())
+        }
+        self.reset()
+
+    def reset(self):
+        self.state_values = {key: 0.0 for key in METRIC_STATE_KEYS[:9]}
+
+    def accumulate(self, actual_item_ids, generated_sem_ids):
+        actual_items = actual_item_ids.reshape(-1).detach().cpu().tolist()
+        generated_codes = generated_sem_ids.detach().cpu().tolist()
+        for actual_item, ranked_codes in zip(actual_items, generated_codes, strict=True):
+            ranked_items = []
+            self.state_values["prediction_count"] += len(ranked_codes)
+            for code in ranked_codes:
+                item_id = self.code_to_item.get(tuple(code))
+                self.state_values["invalid_id_count"] += item_id is None
+                ranked_items.append(item_id)
+            rank = next(
+                (
+                    index
+                    for index, item_id in enumerate(ranked_items, start=1)
+                    if item_id == actual_item
+                ),
+                None,
+            )
+            for cutoff in (5, 10):
+                if rank is not None and rank <= cutoff:
+                    self.state_values[f"item_hr@{cutoff}"] += 1.0
+                    self.state_values[f"item_ndcg@{cutoff}"] += 1.0 / math.log2(
+                        rank + 1.0
+                    )
+                    self.state_values[f"item_mrr@{cutoff}"] += 1.0 / rank
+            self.state_values["item_total"] += 1.0
+
+    def state(self):
+        return dict(self.state_values)
+
+
+class SemanticTopKAccumulator:
+    def __init__(self, ks=(5, 10)):
+        if tuple(ks) != (5, 10):
+            raise ValueError("semantic diagnostics are fixed to cutoffs (5, 10)")
+        self.reset()
+
+    def reset(self):
+        self.state_values = {key: 0.0 for key in METRIC_STATE_KEYS[9:]}
+
+    def accumulate(self, actual, top_k):
+        matches = (actual.unsqueeze(1) == top_k).all(dim=-1)
+        for row in matches.detach().cpu().tolist():
+            rank = next((index for index, matched in enumerate(row, start=1) if matched), None)
+            if rank is not None and rank <= 5:
+                self.state_values["semantic_h@5"] += 1.0
+            if rank is not None and rank <= 10:
+                self.state_values["semantic_h@10"] += 1.0
+                self.state_values["semantic_ndcg@10"] += 1.0 / math.log2(rank + 1.0)
+            self.state_values["semantic_total"] += 1.0
+
+    def state(self):
+        return dict(self.state_values)
+
+
+def merge_metric_states(metric_states):
+    return {
+        key: sum(float(state.get(key, 0.0)) for state in metric_states)
+        for key in METRIC_STATE_KEYS
+    }
+
+
+def reduce_metric_state(metric_state, accelerator):
+    values = torch.tensor(
+        [metric_state[key] for key in METRIC_STATE_KEYS],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+    reduced = accelerator.reduce(values, reduction="sum")
+    return {key: reduced[index].item() for index, key in enumerate(METRIC_STATE_KEYS)}
+
+
+def finalize_eval_metrics(metric_state):
+    item_total = metric_state["item_total"]
+    semantic_total = metric_state["semantic_total"]
+    prediction_count = metric_state["prediction_count"]
+    if item_total <= 0 or semantic_total <= 0 or prediction_count <= 0:
+        raise ValueError("cannot finalize evaluation metrics without predictions")
+    return {
+        "hr@5": metric_state["item_hr@5"] / item_total,
+        "hr@10": metric_state["item_hr@10"] / item_total,
+        "ndcg@5": metric_state["item_ndcg@5"] / item_total,
+        "ndcg@10": metric_state["item_ndcg@10"] / item_total,
+        "mrr@5": metric_state["item_mrr@5"] / item_total,
+        "mrr@10": metric_state["item_mrr@10"] / item_total,
+        "invalid_id_count": int(metric_state["invalid_id_count"]),
+        "invalid_id_rate": metric_state["invalid_id_count"] / prediction_count,
+        "diagnostic_semantic_h@5": metric_state["semantic_h@5"] / semantic_total,
+        "diagnostic_semantic_h@10": metric_state["semantic_h@10"] / semantic_total,
+        "diagnostic_semantic_ndcg@10": (
+            metric_state["semantic_ndcg@10"] / semantic_total
+        ),
+    }
+
+
+def run_full_evaluation(
+    model,
+    tokenizer,
+    eval_dataloader,
+    device,
+    accelerator,
+    codebooks,
+    description=None,
+):
+    item_accumulator = ItemTopKAccumulator(codebooks, ks=(5, 10))
+    semantic_accumulator = SemanticTopKAccumulator(ks=(5, 10))
+    with tqdm(
+        eval_dataloader,
+        desc=description,
+        disable=not accelerator.is_main_process,
+    ) as progress:
+        for batch in progress:
+            data = batch_to(batch, device)
+            tokenized_data = tokenizer(data)
+            with torch.no_grad():
+                generated = model.generate_next_sem_id(
+                    tokenized_data, top_k=True, temperature=1
+                )
+            actual_sem_ids = get_full_eval_targets(tokenized_data)
+            if actual_sem_ids.shape[-1] != 4:
+                raise ValueError(
+                    f"full target width must be 4; got {actual_sem_ids.shape[-1]}"
+                )
+            (
+                gathered_item_ids,
+                gathered_generated_sem_ids,
+                gathered_actual_sem_ids,
+            ) = accelerator.gather_for_metrics(
+                (data.ids_fut, generated.sem_ids, actual_sem_ids)
+            )
+            if accelerator.is_main_process:
+                semantic_accumulator.accumulate(
+                    actual=gathered_actual_sem_ids,
+                    top_k=gathered_generated_sem_ids,
+                )
+                item_accumulator.accumulate(
+                    actual_item_ids=gathered_item_ids,
+                    generated_sem_ids=gathered_generated_sem_ids,
+                )
+
+    local_state = merge_metric_states(
+        [item_accumulator.state(), semantic_accumulator.state()]
+    )
+    return finalize_eval_metrics(reduce_metric_state(local_state, accelerator))
+
+
+def publish_eval_metrics(
+    eval_metrics,
+    accelerator,
+    wandb_logging,
+    log_fn=None,
+    print_fn=print,
+):
+    if not accelerator.is_main_process:
+        return False
+    print_fn(eval_metrics)
+    if wandb_logging:
+        (log_fn or wandb.log)(eval_metrics)
+    return True
+
+
+def should_run_full_eval(step, iterations, full_eval_every, full_eval_iterations):
+    explicit_steps = set(full_eval_iterations or ())
+    return (
+        step == iterations
+        or step in explicit_steps
+        or (full_eval_every is not None and step % full_eval_every == 0)
+    )
+
+
 @gin.configurable
 def train(
     iterations=500000,
     batch_size=64,
     learning_rate=0.001,
+    lr_warmup_steps=10000,
     weight_decay=0.01,
     dataset_folder="dataset/ml-1m",
     save_dir_root="out/",
@@ -42,6 +291,7 @@ def train(
     save_model_every=1000000,
     partial_eval_every=1000,
     full_eval_every=10000,
+    full_eval_iterations=None,
     vae_input_dim=18,
     vae_embed_dim=16,
     vae_hidden_dims=[18, 18],
@@ -62,7 +312,6 @@ def train(
     top_k_for_generation=10,
     should_add_sep_token=True,
     num_user_bins=None,
-    top_k_eval_list=[1, 5, 10],
 ):
     if dataset != RecDataset.AMAZON:
         raise Exception(f"Dataset currently not supported: {dataset}.")
@@ -128,12 +377,9 @@ def train(
         login()
         tokenizer.rq_vae.push_to_hub(vae_hf_model_name)
 
-    codebooks = tokenizer.cached_ids[:, :vae_n_layers].cpu()
-
-    model = EncoderDecoderRetrievalModel(
-        codebooks=codebooks,
-        num_hierarchies=vae_n_layers,
-        num_embeddings_per_hierarchy=vae_codebook_size,
+    model, codebooks, token_cardinalities = build_decoder_model(
+        tokenizer=tokenizer,
+        vae_codebook_size=vae_codebook_size,
         t5_d_model=t5_d_model,
         t5_num_heads=t5_num_heads,
         t5_d_ff=t5_d_ff,
@@ -148,7 +394,10 @@ def train(
         params=model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
-    lr_scheduler = InverseSquareRootScheduler(optimizer=optimizer, warmup_steps=10000)
+    lr_scheduler = build_decoder_scheduler(
+        optimizer=optimizer,
+        lr_warmup_steps=lr_warmup_steps,
+    )
 
     start_iter = 0
     if pretrained_decoder_path is not None:
@@ -163,7 +412,6 @@ def train(
 
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
-    metrics_accumulator = TopKAccumulator(ks=top_k_eval_list)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {device}, Num Parameters: {num_params}")
 
@@ -218,32 +466,27 @@ def train(
                 if wandb_logging and accelerator.is_main_process:
                     wandb.log({"eval_loss": eval_loss})
 
-            if (iter + 1) % full_eval_every == 0:
+            if should_run_full_eval(
+                step=iter + 1,
+                iterations=iterations,
+                full_eval_every=full_eval_every,
+                full_eval_iterations=full_eval_iterations,
+            ):
                 model.eval()
-                with tqdm(
-                    eval_dataloader,
-                    desc=f"Eval {iter + 1}",
-                    disable=not accelerator.is_main_process,
-                ) as pbar_eval:
-                    for batch in pbar_eval:
-                        data = batch_to(batch, device)
-                        tokenized_data = tokenizer(data)
-
-                        with torch.no_grad():
-                            generated = model.generate_next_sem_id(
-                                tokenized_data, top_k=True, temperature=1
-                            )
-
-                        actual = tokenized_data.sem_ids_fut[:, :vae_n_layers]
-                        metrics_accumulator.accumulate(
-                            actual=actual, top_k=generated.sem_ids
-                        )
-
-                eval_metrics = metrics_accumulator.reduce()
-                print(eval_metrics)
-                if accelerator.is_main_process and wandb_logging:
-                    wandb.log(eval_metrics)
-                metrics_accumulator.reset()
+                eval_metrics = run_full_evaluation(
+                    model=model,
+                    tokenizer=tokenizer,
+                    eval_dataloader=eval_dataloader,
+                    device=device,
+                    accelerator=accelerator,
+                    codebooks=codebooks,
+                    description=f"Eval {iter + 1}",
+                )
+                publish_eval_metrics(
+                    eval_metrics=eval_metrics,
+                    accelerator=accelerator,
+                    wandb_logging=wandb_logging,
+                )
 
             if accelerator.is_main_process:
                 if (iter + 1) % save_model_every == 0 or iter + 1 == iterations:
