@@ -277,6 +277,7 @@ def train(
     learning_rate=0.001,
     lr_warmup_steps=10000,
     weight_decay=0.01,
+    optimizer_name="adamw",
     dataset_folder="dataset/ml-1m",
     save_dir_root="out/",
     dataset=RecDataset.ML_1M,
@@ -390,14 +391,29 @@ def train(
     )
     model = torch.compile(model)
 
-    optimizer = AdamW(
-        params=model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+    if optimizer_name == "adafactor":
+        from transformers import Adafactor
 
-    lr_scheduler = build_decoder_scheduler(
-        optimizer=optimizer,
-        lr_warmup_steps=lr_warmup_steps,
-    )
+        optimizer = Adafactor(
+            params=model.parameters(),
+            lr=None,
+            relative_step=True,
+            scale_parameter=True,
+            warmup_init=True,
+            weight_decay=0.0,
+            clip_threshold=1.0,
+        )
+        lr_scheduler = None
+    elif optimizer_name == "adamw":
+        optimizer = AdamW(
+            params=model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+        lr_scheduler = build_decoder_scheduler(
+            optimizer=optimizer,
+            lr_warmup_steps=lr_warmup_steps,
+        )
+    else:
+        raise ValueError(f"unsupported optimizer_name: {optimizer_name}")
 
     start_iter = 0
     if pretrained_decoder_path is not None:
@@ -406,11 +422,16 @@ def train(
         )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        if "scheduler" in checkpoint:
+        if "scheduler" in checkpoint and lr_scheduler is not None:
             lr_scheduler.load_state_dict(checkpoint["scheduler"])
         start_iter = checkpoint["iter"] + 1
 
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    if lr_scheduler is not None:
+        model, optimizer, lr_scheduler = accelerator.prepare(
+            model, optimizer, lr_scheduler
+        )
+    else:
+        model, optimizer = accelerator.prepare(model, optimizer)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {device}, Num Parameters: {num_params}")
@@ -450,7 +471,8 @@ def train(
             if max_grad_norm is not None:
                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
-            lr_scheduler.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
             accelerator.wait_for_everyone()
 
@@ -494,7 +516,11 @@ def train(
                         "iter": iter,
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": lr_scheduler.state_dict(),
+                        "scheduler": (
+                            lr_scheduler.state_dict()
+                            if lr_scheduler is not None
+                            else None
+                        ),
                     }
 
                     if not os.path.exists(save_dir_root):
