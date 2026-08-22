@@ -199,6 +199,7 @@ def train(
     seed: int = 20260701,
     dataset_folder: str = "dataset/amazon-p5-st5",
     dataset_split: str = "beauty",
+    expected_num_items: int = 12101,
     save_dir_root: str = "out/rqvae-fix-matrix/",
 ) -> dict[str, Any]:
     if batch_size != 1024:
@@ -222,8 +223,11 @@ def train(
         train_test_split="all",
         split=dataset_split,
     )
-    if len(dataset) != 12101:
-        raise ValueError(f"expected 12101 items, found {len(dataset)}")
+    if len(dataset) != expected_num_items:
+        raise ValueError(
+            f"expected {expected_num_items} items for split {dataset_split}, "
+            f"found {len(dataset)}"
+        )
 
     init_idx = epoch_permutation(len(dataset), seed, 1)[:batch_size].tolist()
     init_batch_x = dataset[init_idx].x
@@ -256,6 +260,7 @@ def train(
         "seed": seed,
         "dataset_folder": dataset_folder,
         "dataset_split": dataset_split,
+        "expected_num_items": expected_num_items,
     }
 
     started = time.perf_counter()
