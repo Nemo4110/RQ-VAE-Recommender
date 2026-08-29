@@ -3,11 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data.schemas import TokenizedSeqBatch
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Sequence
 from torch import Tensor
 from transformers import T5EncoderModel
 from transformers.models.t5.modeling_t5 import T5Config, T5Stack
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+
+from modules.tiger_policy import HISTORICAL_NATIVE
+from modules.tiger_policy import PAPER_FULL_ID
+from modules.tiger_policy import select_semantic_id_tokens
+from modules.tiger_policy import token_type_offsets
 
 torch.set_float32_matmul_precision("high")
 
@@ -23,26 +28,25 @@ class GenerationOutput(NamedTuple):
     log_probas: Tensor
 
 
-def _strip_dedup_col(
-    tensor: torch.Tensor, sem_ids_dim: int, n_layers: int
+def _select_policy_tokens(
+    tensor: torch.Tensor,
+    *,
+    source_item_width: int,
+    target_item_width: int,
 ) -> torch.Tensor:
-    """Strip the deduplication column appended by SemanticIdTokenizer.
+    """Select a named token-policy width from flattened item token groups."""
 
-    Args:
-        tensor:      [B, N * sem_ids_dim]  where sem_ids_dim = n_layers + 1
-        sem_ids_dim: tokens per item including the dedup column
-        n_layers:    number of RQ-VAE codebook levels
-
-    Returns:
-        [B, N * n_layers]
-    """
-    B, total = tensor.shape
-    N = total // sem_ids_dim
-    return (
-        tensor.view(B, N, sem_ids_dim)[:, :, :n_layers]
-        .contiguous()
-        .view(B, N * n_layers)
-    )
+    if tensor.ndim != 2:
+        raise ValueError("token tensor must have shape [batch, flattened_items]")
+    if source_item_width < target_item_width or tensor.shape[1] % source_item_width:
+        raise ValueError(
+            f"token tensor width {tensor.shape[1]} is incompatible with "
+            f"source item width {source_item_width}"
+        )
+    batch_size, total_width = tensor.shape
+    return tensor.view(batch_size, total_width // source_item_width, source_item_width)[
+        ..., :target_item_width
+    ].reshape(batch_size, -1)
 
 
 class EncoderDecoderRetrievalModel(nn.Module):
@@ -59,6 +63,9 @@ class EncoderDecoderRetrievalModel(nn.Module):
         codebooks: torch.Tensor,
         num_hierarchies: int,
         num_embeddings_per_hierarchy: int,
+        token_cardinalities: Optional[Sequence[int]] = None,
+        token_policy: str = HISTORICAL_NATIVE,
+        source_sem_ids_dim: Optional[int] = None,
         t5_d_model: int = 128,
         t5_num_heads: int = 6,
         t5_d_ff: int = 1024,
@@ -71,11 +78,45 @@ class EncoderDecoderRetrievalModel(nn.Module):
 
         self.num_hierarchies = num_hierarchies
         self.num_embeddings_per_hierarchy = num_embeddings_per_hierarchy
+        if token_policy not in (HISTORICAL_NATIVE, PAPER_FULL_ID):
+            raise ValueError(f"unsupported token policy: {token_policy!r}")
+        self.token_policy = token_policy
+        self.rqvae_n_layers = (
+            num_hierarchies
+            if token_policy == HISTORICAL_NATIVE
+            else num_hierarchies - 1
+        )
+        self.source_sem_ids_dim = source_sem_ids_dim or (
+            self.rqvae_n_layers
+            if token_policy == PAPER_FULL_ID
+            else self.rqvae_n_layers + 1
+        )
+        self.token_cardinalities = tuple(
+            int(cardinality)
+            for cardinality in (
+                token_cardinalities
+                if token_cardinalities is not None
+                else [num_embeddings_per_hierarchy] * num_hierarchies
+            )
+        )
+        if len(self.token_cardinalities) != num_hierarchies:
+            raise ValueError("token_cardinalities must match num_hierarchies")
+        if any(cardinality <= 0 for cardinality in self.token_cardinalities):
+            raise ValueError("token cardinalities must be positive")
+        if self.source_sem_ids_dim < num_hierarchies:
+            raise ValueError("source_sem_ids_dim cannot be smaller than decoder width")
+        self.register_buffer(
+            "token_type_offsets",
+            torch.tensor(token_type_offsets(self.token_cardinalities), dtype=torch.long),
+            persistent=False,
+        )
         self.top_k_for_generation = top_k_for_generation
         self.register_buffer("codebooks", codebooks)
+        if codebooks.ndim != 2 or codebooks.shape[1] != num_hierarchies:
+            raise ValueError("codebooks width must match num_hierarchies")
 
         encoder_config = T5Config(
-            vocab_size=num_embeddings_per_hierarchy * num_hierarchies,
+            vocab_size=sum(self.token_cardinalities),
             d_model=t5_d_model,
             num_heads=t5_num_heads,
             d_ff=t5_d_ff,
@@ -85,7 +126,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
         self.encoder = T5EncoderModel(encoder_config)
 
         decoder_config = T5Config(
-            vocab_size=num_embeddings_per_hierarchy * num_hierarchies,
+            vocab_size=sum(self.token_cardinalities),
             d_model=t5_d_model,
             num_heads=t5_num_heads,
             d_ff=t5_d_ff,
@@ -97,14 +138,14 @@ class EncoderDecoderRetrievalModel(nn.Module):
         self.bos_token = nn.Parameter(torch.randn(1, t5_d_model), requires_grad=True)
         self.decoder_mlp = nn.ModuleList(
             [
-                nn.Linear(t5_d_model, num_embeddings_per_hierarchy, bias=False)
-                for _ in range(num_hierarchies)
+                nn.Linear(t5_d_model, cardinality, bias=False)
+                for cardinality in self.token_cardinalities
             ]
         )
 
-        # Shared embedding table; hierarchy h, token t maps to index h * codebook_size + t.
+        # Shared embedding table uses cumulative offsets for variable token cardinalities.
         self.item_sid_embedding_table = nn.Embedding(
-            num_embeddings=num_embeddings_per_hierarchy * num_hierarchies,
+            num_embeddings=sum(self.token_cardinalities),
             embedding_dim=t5_d_model,
         )
 
@@ -137,9 +178,9 @@ class EncoderDecoderRetrievalModel(nn.Module):
         if input_sids.ndim != 2:
             raise ValueError("Input tensor must be 2-dimensional.")
         _, num_cols = input_sids.shape
-        offsets = (
-            torch.arange(num_hierarchies, device=input_sids.device) * codebook_size
-        )
+        if num_hierarchies != self.num_hierarchies:
+            raise ValueError("num_hierarchies must match the model token policy")
+        offsets = self.token_type_offsets.to(input_sids.device)
         num_repeats = (num_cols + num_hierarchies - 1) // num_hierarchies
         repeated_offsets = offsets.repeat(num_repeats)[:num_cols]
         result = input_sids + repeated_offsets
@@ -268,12 +309,24 @@ class EncoderDecoderRetrievalModel(nn.Module):
         return out.last_hidden_state
 
     def forward(self, batch: TokenizedSeqBatch) -> ModelOutput:
-        sem_ids_dim = self.num_hierarchies + 1
-        input_ids = _strip_dedup_col(batch.sem_ids, sem_ids_dim, self.num_hierarchies)
-        attention_mask = _strip_dedup_col(
-            batch.seq_mask.long(), sem_ids_dim, self.num_hierarchies
+        input_ids = select_semantic_id_tokens(
+            batch.sem_ids,
+            n_layers=self.rqvae_n_layers,
+            token_policy=self.token_policy,
+            source_item_width=self.source_sem_ids_dim,
         )
-        fut_ids = batch.sem_ids_fut[:, : self.num_hierarchies]
+        attention_mask = select_semantic_id_tokens(
+            batch.seq_mask.long(),
+            n_layers=self.rqvae_n_layers,
+            token_policy=self.token_policy,
+            source_item_width=self.source_sem_ids_dim,
+        )
+        fut_ids = select_semantic_id_tokens(
+            batch.sem_ids_fut,
+            n_layers=self.rqvae_n_layers,
+            token_policy=self.token_policy,
+            source_item_width=self.source_sem_ids_dim,
+        )
 
         encoder_output, attention_mask_for_encoder = self.encoder_forward_pass(
             attention_mask=attention_mask,
@@ -311,7 +364,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
         """
         B = input_ids.size(0)
         k = self.top_k_for_generation
-        n_cands = min(64, self.num_embeddings_per_hierarchy)
+        n_cands = min(64, max(self.token_cardinalities))
 
         enc_out, enc_mask = self.encoder_forward_pass(
             attention_mask=attention_mask,
@@ -342,6 +395,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
             )
 
             probas = F.softmax(self.decoder_mlp[h](dec_out[:, -1, :]), dim=-1)
+            n_cands = min(64, self.token_cardinalities[h])
             samples = torch.multinomial(probas, num_samples=n_cands)
             samp_log_p = torch.log(torch.gather(probas, 1, samples))
 
@@ -397,10 +451,17 @@ class EncoderDecoderRetrievalModel(nn.Module):
         top_k: bool = True,
         temperature: int = 1,
     ) -> GenerationOutput:
-        sem_ids_dim = self.num_hierarchies + 1
-        input_ids = _strip_dedup_col(batch.sem_ids, sem_ids_dim, self.num_hierarchies)
-        attention_mask = _strip_dedup_col(
-            batch.seq_mask.long(), sem_ids_dim, self.num_hierarchies
+        input_ids = select_semantic_id_tokens(
+            batch.sem_ids,
+            n_layers=self.rqvae_n_layers,
+            token_policy=self.token_policy,
+            source_item_width=self.source_sem_ids_dim,
+        )
+        attention_mask = select_semantic_id_tokens(
+            batch.seq_mask.long(),
+            n_layers=self.rqvae_n_layers,
+            token_policy=self.token_policy,
+            source_item_width=self.source_sem_ids_dim,
         )
         generated_ids, log_probas = self.generate(
             attention_mask=attention_mask,

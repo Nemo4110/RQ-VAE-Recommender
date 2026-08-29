@@ -11,9 +11,18 @@ from data.utils import batch_to
 from data.utils import cycle
 from data.utils import next_batch
 from evaluate.metrics import TopKAccumulator
+from evaluate.tiger_native import NativeItemTopKAccumulator
 from modules.model import EncoderDecoderRetrievalModel
 from modules.scheduler.inv_sqrt import InverseSquareRootScheduler
 from modules.tokenizer.semids import SemanticIdTokenizer
+from modules.tiger_policy import HISTORICAL_NATIVE
+from modules.tiger_policy import DATASET_CAPPED_USER_BINS
+from modules.tiger_policy import NATIVE_SEMANTIC_ID
+from modules.tiger_policy import TIGERPolicyConfig
+from modules.tiger_policy import select_semantic_id_tokens
+from modules.tiger_policy import token_cardinalities
+from modules.tiger_policy import validate_checkpoint_policy
+from modules.tiger_policy import validate_full_semantic_ids
 from modules.utils import compute_debug_metrics
 from modules.utils import parse_config
 from huggingface_hub import login
@@ -63,8 +72,31 @@ def train(
     top_k_for_generation=10,
     should_add_sep_token=True,
     num_user_bins=None,
+    tiger_token_policy=HISTORICAL_NATIVE,
+    paper_aligned=False,
+    user_token_policy="modulo_hashed_bucket",
+    user_bin_mode="explicit",
+    user_bin_cap=2000,
+    evaluator_policy="native_semantic_id",
     top_k_eval_list=[1, 5, 10],
 ):
+    policy = TIGERPolicyConfig(
+        token_policy=tiger_token_policy,
+        paper_aligned=paper_aligned,
+        num_user_bins=num_user_bins,
+        user_token_policy=user_token_policy,
+        user_bin_mode=user_bin_mode,
+        user_bin_cap=user_bin_cap,
+        evaluator_policy=evaluator_policy,
+        rqvae_n_layers=vae_n_layers,
+    )
+    policy.validate()
+    if evaluator_policy != NATIVE_SEMANTIC_ID:
+        raise ValueError(
+            "train_decoder.py implements the native semantic-ID evaluator; "
+            "teacher-forced full-catalog scoring belongs to a separate adapter"
+        )
+
     if dataset != RecDataset.AMAZON:
         raise Exception(f"Dataset currently not supported: {dataset}.")
 
@@ -95,6 +127,9 @@ def train(
         subsample=train_data_subsample,
         split=dataset_split,
     )
+    dataset_user_count = int(torch.unique(train_dataset.sequence_data["userId"]).numel())
+    policy = policy.for_dataset(dataset_user_count)
+    policy.validate()
     eval_dataset = SeqData(
         root=dataset_folder,
         dataset=dataset,
@@ -130,19 +165,38 @@ def train(
         login()
         tokenizer.rq_vae.push_to_hub(vae_hf_model_name)
 
-    codebooks = tokenizer.cached_ids[:, :vae_n_layers].cpu()
+    all_codebooks = tokenizer.cached_ids.cpu()
+    if policy.uses_collision_suffix:
+        full_id_summary = validate_full_semantic_ids(all_codebooks)
+        if not full_id_summary["full_id_unique"]:
+            raise ValueError(
+                "paper/full-id policy requires unique post-training full semantic IDs"
+            )
+        codebooks = all_codebooks
+    else:
+        codebooks = all_codebooks[:, :vae_n_layers]
+    decoder_cardinalities = token_cardinalities(
+        codebooks,
+        n_layers=vae_n_layers,
+        rqvae_codebook_size=vae_codebook_size,
+        token_policy=policy.token_policy,
+    )
+    print({"tiger_policy": policy.metadata(), "token_cardinalities": decoder_cardinalities})
 
     model = EncoderDecoderRetrievalModel(
         codebooks=codebooks,
-        num_hierarchies=vae_n_layers,
+        num_hierarchies=len(decoder_cardinalities),
         num_embeddings_per_hierarchy=vae_codebook_size,
+        token_cardinalities=decoder_cardinalities,
+        token_policy=policy.token_policy,
+        source_sem_ids_dim=tokenizer.sem_ids_dim,
         t5_d_model=t5_d_model,
         t5_num_heads=t5_num_heads,
         t5_d_ff=t5_d_ff,
         t5_num_layers=t5_num_layers,
         top_k_for_generation=top_k_for_generation,
         should_add_sep_token=should_add_sep_token,
-        num_user_bins=num_user_bins,
+        num_user_bins=policy.effective_num_user_bins,
     )
     model = torch.compile(model)
 
@@ -157,6 +211,7 @@ def train(
         checkpoint = torch.load(
             pretrained_decoder_path, map_location=device, weights_only=False
         )
+        validate_checkpoint_policy(checkpoint.get("tiger_policy"), policy)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scheduler" in checkpoint:
@@ -165,7 +220,11 @@ def train(
 
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
-    metrics_accumulator = TopKAccumulator(ks=top_k_eval_list)
+    metrics_accumulator = (
+        NativeItemTopKAccumulator(codebooks, ks=tuple(top_k_eval_list))
+        if policy.uses_collision_suffix
+        else TopKAccumulator(ks=top_k_eval_list)
+    )
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {device}, Num Parameters: {num_params}")
 
@@ -236,10 +295,21 @@ def train(
                                 tokenized_data, top_k=True, temperature=1
                             )
 
-                        actual = tokenized_data.sem_ids_fut[:, :vae_n_layers]
-                        metrics_accumulator.accumulate(
-                            actual=actual, top_k=generated.sem_ids
+                        actual = select_semantic_id_tokens(
+                            tokenized_data.sem_ids_fut,
+                            n_layers=vae_n_layers,
+                            token_policy=policy.token_policy,
+                            source_item_width=tokenizer.sem_ids_dim,
                         )
+                        if policy.uses_collision_suffix:
+                            metrics_accumulator.accumulate(
+                                actual_semantic_ids=actual,
+                                generated_semantic_ids=generated.sem_ids,
+                            )
+                        else:
+                            metrics_accumulator.accumulate(
+                                actual=actual, top_k=generated.sem_ids
+                            )
 
                 eval_metrics = metrics_accumulator.reduce()
                 print(eval_metrics)
@@ -254,6 +324,8 @@ def train(
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "scheduler": lr_scheduler.state_dict(),
+                        "tiger_policy": policy.metadata(),
+                        "token_cardinalities": decoder_cardinalities,
                     }
 
                     if not os.path.exists(save_dir_root):
