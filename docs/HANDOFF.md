@@ -204,7 +204,7 @@ sed -n '1,260p' docs/HANDOFF.md
 
 ## 11. 本轮已完成的 CPU-only 修改
 
-截至 2026-08-29，本轮已完成但尚未提交的工作区修改：
+截至 2026-08-29，本轮已完成并提交到 `repro/tiger-paper-audit` 的修改：
 
 - 新增 `modules/tiger_policy.py`：token policy、user-bin preflight、token cardinality、suffix 唯一性和 checkpoint policy 校验；
 - 新增 `evaluate/tiger_native.py`：完整 Semantic ID 到 frozen catalog item 的 native 映射、invalid-ID 统计和 item-level accumulator；明确不实现 Temporal-v1 teacher-forced scorer；
@@ -214,4 +214,11 @@ sed -n '1,260p' docs/HANDOFF.md
 - 新增 `tests/test_tiger_policy.py`，覆盖纯 policy 逻辑和条件式 CPU model forward；model 测试在缺少 Transformers 时按测试框架约定跳过；
 - 新增项目级 `AGENTS.md` 及 `CLAUDE.md -> AGENTS.md`，用于保持后续 agent 方向一致。
 
-此前错误地使用了 `/root/miniconda3/bin/python`，该解释器缺少项目依赖。正确环境是 `/root/autodl-tmp/recsys-roi-study/external/venvs/rqvae-recommender/bin/python`；其中已确认存在 pytest、transformers、einops、accelerate、gin 和 huggingface_hub。后续所有项目验证必须使用该环境。
+提交序列：
+
+- `f7dd2d7 docs: add TIGER audit handoff`
+- `6e27291 feat: add TIGER policy contracts`
+- `f657fe3 feat: wire TIGER native evaluation`
+- `bccba13 test: add TIGER audit regressions`
+
+正确环境是 `/root/autodl-tmp/recsys-roi-study/external/venvs/rqvae-recommender/bin/python`；该环境包含 pytest、transformers、einops、accelerate、gin 和 huggingface_hub。完整 pytest 和 compileall 已通过。
