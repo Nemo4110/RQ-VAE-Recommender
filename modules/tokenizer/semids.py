@@ -100,8 +100,44 @@ class SemanticIdTokenizer(nn.Module):
         self.cached_ids = None
 
     @property
-    def sem_ids_dim(self):
+    def rqvae_n_layers(self) -> int:
+        """Number of trainable RQ-VAE codebook levels."""
+
+        return self.n_layers
+
+    @property
+    def sem_ids_dim(self) -> int:
+        """Number of full item-ID tokens, including the collision suffix."""
+
         return self.n_layers + 1
+
+    @property
+    def collision_suffix_column(self) -> int:
+        """Column containing the post-training collision-resolution suffix."""
+
+        return self.n_layers
+
+    def summarize_collision_resolution(self) -> dict[str, int | bool]:
+        """Summarize the cached post-training full semantic IDs."""
+
+        if self.cached_ids is None:
+            raise RuntimeError("corpus IDs must be precomputed before summarizing collisions")
+        full_ids = self.cached_ids
+        unique_count = int(torch.unique(full_ids, dim=0).shape[0])
+        suffix = full_ids[:, self.collision_suffix_column]
+        return {
+            "item_count": int(full_ids.shape[0]),
+            "rqvae_n_layers": self.rqvae_n_layers,
+            "full_id_width": int(full_ids.shape[1]),
+            "unique_full_id_count": unique_count,
+            "full_id_unique": unique_count == int(full_ids.shape[0]),
+            "suffix_cardinality": int(suffix.max().item()) + 1
+            if suffix.numel()
+            else 0,
+            "max_collision_bucket": int(suffix.max().item()) + 1
+            if suffix.numel()
+            else 0,
+        }
 
     @torch.no_grad
     @eval_mode
@@ -133,7 +169,7 @@ class SemanticIdTokenizer(nn.Module):
                 hits += is_hit.sum(axis=-1)
                 cached_ids = pack([cached_ids, batch_ids], "* d")[0]
             dedup_dim.append(hits)
-        # Concatenate new column to deduplicate ids
+        # Append a post-training collision-resolution suffix; this is not an RQ-VAE layer.
         dedup_dim_tensor = pack(dedup_dim, "*")[0]
         self.cached_ids = pack([cached_ids, dedup_dim_tensor], "b *")[0]
 
