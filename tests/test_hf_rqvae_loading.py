@@ -79,7 +79,7 @@ def test_legacy_checkpoint_loading_remains_available(tmp_path) -> None:
 def test_decoder_train_exposes_hub_path() -> None:
     import train_decoder
 
-    assert "pretrained_rqvae_hf_path" in inspect.signature(
-        train_decoder.train
-    ).parameters
+    train_parameters = inspect.signature(train_decoder.train).parameters
+    assert "pretrained_rqvae_hf_path" in train_parameters
+    assert "seed" in train_parameters
 

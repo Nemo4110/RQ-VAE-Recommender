@@ -1,4 +1,5 @@
 import os
+import random
 import gin
 import torch
 import wandb
@@ -78,6 +79,7 @@ def train(
     user_bin_mode="explicit",
     user_bin_cap=2000,
     evaluator_policy="native_semantic_id",
+    seed=None,
     top_k_eval_list=[1, 5, 10],
 ):
     policy = TIGERPolicyConfig(
@@ -96,6 +98,9 @@ def train(
             "train_decoder.py implements the native semantic-ID evaluator; "
             "teacher-forced full-catalog scoring belongs to a separate adapter"
         )
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
 
     if dataset != RecDataset.AMAZON:
         raise Exception(f"Dataset currently not supported: {dataset}.")
@@ -181,7 +186,13 @@ def train(
         rqvae_codebook_size=vae_codebook_size,
         token_policy=policy.token_policy,
     )
-    print({"tiger_policy": policy.metadata(), "token_cardinalities": decoder_cardinalities})
+    print(
+        {
+            "seed": seed,
+            "tiger_policy": policy.metadata(),
+            "token_cardinalities": decoder_cardinalities,
+        }
+    )
 
     model = EncoderDecoderRetrievalModel(
         codebooks=codebooks,
@@ -326,6 +337,7 @@ def train(
                         "scheduler": lr_scheduler.state_dict(),
                         "tiger_policy": policy.metadata(),
                         "token_cardinalities": decoder_cardinalities,
+                        "seed": seed,
                     }
 
                     if not os.path.exists(save_dir_root):
