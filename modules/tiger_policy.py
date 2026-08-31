@@ -15,13 +15,32 @@ import torch
 HISTORICAL_NATIVE = "historical/native"
 PAPER_FULL_ID = "paper/full-id"
 MODULO_HASHED_BUCKET = "modulo_hashed_bucket"
+STABLE_HASHED_BUCKET = "stable_hashed_bucket"
 EXPLICIT_USER_BINS = "explicit"
 PAPER_FIXED_USER_BINS = "paper_fixed"
 DATASET_CAPPED_USER_BINS = "dataset_capped"
 NATIVE_SEMANTIC_ID = "native_semantic_id"
+PAPER_CANDIDATE_UNCONSTRAINED = "paper_candidate_unconstrained"
 TEACHER_FORCED_FULL_CATALOG = "teacher_forced_full_catalog"
 
 TokenPolicy = Literal["historical/native", "paper/full-id"]
+
+
+def validate_non_placeholder_tiger_content(item_texts: Sequence[object]) -> None:
+    """Reject the all-placeholder P5 smoke artifact for semantic-ID learning."""
+
+    item_count = len(item_texts)
+    if item_count == 0:
+        raise ValueError("TIGER content artifact must contain at least one item text")
+    placeholder_count = sum(
+        str(text).startswith("p5 ") and " smoke item " in str(text)
+        for text in item_texts
+    )
+    if placeholder_count == item_count:
+        raise ValueError(
+            "feature-dependent TIGER training cannot use the all-placeholder "
+            "P5 smoke content artifact; select a real item-text/feature corpus"
+        )
 
 
 @dataclass(frozen=True)
@@ -52,6 +71,13 @@ class TIGERPolicyConfig:
             )
         if self.num_user_bins is not None and self.num_user_bins <= 0:
             raise ValueError("num_user_bins must be positive when provided")
+        if self.user_token_policy not in (
+            MODULO_HASHED_BUCKET,
+            STABLE_HASHED_BUCKET,
+        ):
+            raise ValueError(
+                f"unsupported user_token_policy={self.user_token_policy!r}"
+            )
         if self.user_bin_mode not in (
             EXPLICIT_USER_BINS,
             PAPER_FIXED_USER_BINS,
@@ -68,16 +94,16 @@ class TIGERPolicyConfig:
                     "TIGER paper-aligned mode requires user_bin_mode=paper_fixed "
                     "and num_user_bins=2000"
                 )
-            if self.user_token_policy != MODULO_HASHED_BUCKET:
-                raise ValueError(
-                    "the current implementation only supports modulo_hashed_bucket "
-                    "for paper-aligned user bins"
-                )
-        if self.token_policy == PAPER_FULL_ID and self.user_token_policy != MODULO_HASHED_BUCKET:
-            raise ValueError(
-                "the current implementation only supports modulo_hashed_bucket "
-                "for full-id user bins"
-            )
+            if self.user_token_policy not in (
+                MODULO_HASHED_BUCKET,
+                STABLE_HASHED_BUCKET,
+            ):
+                raise ValueError("paper-aligned user bins require a supported hash bucket")
+        if self.token_policy == PAPER_FULL_ID and self.user_token_policy not in (
+            MODULO_HASHED_BUCKET,
+            STABLE_HASHED_BUCKET,
+        ):
+            raise ValueError("full-id user bins require a supported hash bucket")
         if self.user_bin_mode == DATASET_CAPPED_USER_BINS:
             if (
                 self.dataset_user_count is not None
@@ -89,6 +115,7 @@ class TIGERPolicyConfig:
                 )
         if self.evaluator_policy not in (
             NATIVE_SEMANTIC_ID,
+            PAPER_CANDIDATE_UNCONSTRAINED,
             TEACHER_FORCED_FULL_CATALOG,
         ):
             raise ValueError(f"unsupported evaluator_policy={self.evaluator_policy!r}")
@@ -145,6 +172,8 @@ class TIGERPolicyConfig:
 def validate_checkpoint_policy(
     checkpoint_policy: dict[str, object] | None,
     expected_policy: TIGERPolicyConfig,
+    *,
+    require_evaluator_policy: bool = True,
 ) -> None:
     """Reject checkpoints whose recorded protocol cannot match this run.
 
@@ -160,7 +189,7 @@ def validate_checkpoint_policy(
             )
         return
     expected = expected_policy.metadata()
-    for key in (
+    keys = (
         "token_policy",
         "paper_aligned",
         "user_token_policy",
@@ -169,8 +198,10 @@ def validate_checkpoint_policy(
         "user_bin_mode",
         "user_bin_cap",
         "dataset_user_count",
-        "evaluator_policy",
-    ):
+    )
+    if require_evaluator_policy:
+        keys += ("evaluator_policy",)
+    for key in keys:
         if checkpoint_policy.get(key) != expected[key]:
             raise ValueError(
                 f"decoder checkpoint TIGER policy mismatch for {key}: "
@@ -238,6 +269,7 @@ def token_cardinalities(
     n_layers: int,
     rqvae_codebook_size: int,
     token_policy: TokenPolicy,
+    full_id_suffix_cardinality: int | None = None,
 ) -> tuple[int, ...]:
     """Return per-position vocabularies for the selected decoder policy."""
 
@@ -252,31 +284,116 @@ def token_cardinalities(
     suffix = codebooks[:, n_layers]
     if suffix.numel() == 0 or suffix.min().item() < 0:
         raise ValueError("collision suffix values must be non-negative")
-    return (rqvae_codebook_size,) * n_layers + (int(suffix.max().item()) + 1,)
+    observed = int(suffix.max().item()) + 1
+    if full_id_suffix_cardinality is None:
+        suffix_cardinality = observed
+    else:
+        if full_id_suffix_cardinality <= 0:
+            raise ValueError("full_id_suffix_cardinality must be positive")
+        if full_id_suffix_cardinality < observed:
+            raise ValueError(
+                "full_id_suffix_cardinality cannot be smaller than the observed "
+                "collision suffix vocabulary"
+            )
+        suffix_cardinality = full_id_suffix_cardinality
+    return (rqvae_codebook_size,) * n_layers + (suffix_cardinality,)
 
 
-def validate_full_semantic_ids(codebooks: torch.Tensor) -> dict[str, int | bool]:
-    """Validate and summarize post-training full-ID uniqueness."""
+def validate_full_semantic_ids(
+    codebooks: torch.Tensor, *, semantic_id_source: str = "rqvae"
+) -> dict[str, int | bool | str]:
+    """Validate full-ID uniqueness without mislabelling random-ID digits as suffixes."""
 
     if codebooks.ndim != 2 or codebooks.shape[1] < 4:
         raise ValueError("full semantic IDs must have at least four columns")
+    if semantic_id_source not in ("rqvae", "random", "lsh"):
+        raise ValueError("semantic_id_source must be 'rqvae', 'random', or 'lsh'")
+    item_count = int(codebooks.shape[0])
     unique_count = int(torch.unique(codebooks, dim=0).shape[0])
-    return {
-        "item_count": int(codebooks.shape[0]),
+    summary: dict[str, int | bool | str] = {
+        "item_count": item_count,
         "unique_full_id_count": unique_count,
-        "full_id_unique": unique_count == int(codebooks.shape[0]),
-        "suffix_cardinality": int(codebooks[:, 3].max().item()) + 1
-        if codebooks.shape[0]
-        else 0,
-        "max_collision_bucket": int(codebooks[:, 3].max().item()) + 1
-        if codebooks.shape[0]
-        else 0,
+        "full_id_unique": unique_count == item_count,
+        "semantic_id_source": semantic_id_source,
     }
+    if semantic_id_source == "rqvae":
+        suffix_cardinality = int(codebooks[:, 3].max().item()) + 1 if item_count else 0
+        summary.update(
+            {
+                "suffix_cardinality": suffix_cardinality,
+                "max_collision_bucket": suffix_cardinality,
+            }
+        )
+    elif semantic_id_source == "random":
+        summary.update(
+            {
+                "random_id_cardinality": int(codebooks.max().item()) + 1 if item_count else 0,
+                "suffix_cardinality": 0,
+                "max_collision_bucket": 0,
+            }
+        )
+    else:
+        summary.update(
+            {
+                "lsh_code_cardinality": int(codebooks.max().item()) + 1 if item_count else 0,
+                "suffix_cardinality": 0,
+                "max_collision_bucket": 0,
+            }
+        )
+    return summary
 
 
-def user_bucket_indices(user_ids: torch.Tensor, num_user_bins: int) -> torch.Tensor:
-    """Apply the repository's explicit modulo user-bucket mapping."""
+
+def validate_semantic_id_source(
+    checkpoint_source: str | None,
+    requested_source: str,
+    *,
+    checkpoint_random_seed: int | None = None,
+    requested_random_seed: int | None = None,
+    checkpoint_random_cardinality: int | None = None,
+    requested_random_cardinality: int | None = None,
+    checkpoint_lsh_seed: int | None = None,
+    requested_lsh_seed: int | None = None,
+    checkpoint_lsh_num_hyperplanes: int | None = None,
+    requested_lsh_num_hyperplanes: int | None = None,
+) -> None:
+    """Reject decoder resume/evaluation under a different frozen item→ID map."""
+
+    if requested_source not in ("rqvae", "random", "lsh"):
+        raise ValueError("requested semantic_id_source must be 'rqvae', 'random', or 'lsh'")
+    if (checkpoint_source or "rqvae") != requested_source:
+        raise ValueError("semantic_id_source mismatch between checkpoint and requested run")
+    if requested_source == "random":
+        if checkpoint_random_seed != requested_random_seed:
+            raise ValueError("random_id_seed mismatch between checkpoint and requested run")
+        if checkpoint_random_cardinality != requested_random_cardinality:
+            raise ValueError(
+                "random_id_cardinality mismatch between checkpoint and requested run"
+            )
+    if requested_source == "lsh":
+        if checkpoint_lsh_seed != requested_lsh_seed:
+            raise ValueError("lsh_seed mismatch between checkpoint and requested run")
+        if checkpoint_lsh_num_hyperplanes != requested_lsh_num_hyperplanes:
+            raise ValueError(
+                "lsh_num_hyperplanes mismatch between checkpoint and requested run"
+            )
+
+def user_bucket_indices(
+    user_ids: torch.Tensor,
+    num_user_bins: int,
+    user_token_policy: str = MODULO_HASHED_BUCKET,
+) -> torch.Tensor:
+    """Map raw user IDs to bounded user-token buckets deterministically."""
 
     if num_user_bins <= 0:
         raise ValueError("num_user_bins must be positive")
-    return torch.remainder(user_ids, num_user_bins)
+    if user_token_policy == MODULO_HASHED_BUCKET:
+        return torch.remainder(user_ids, num_user_bins)
+    if user_token_policy == STABLE_HASHED_BUCKET:
+        # A fixed 31-bit affine mixer gives a stable, non-periodic bucket mapping
+        # for sequential raw IDs without relying on Python's randomized hash().
+        prime = 2_147_483_647
+        mixed = torch.remainder(user_ids.to(torch.long), prime)
+        mixed = torch.remainder(mixed * 1_103_515_245 + 12_345, prime)
+        return torch.remainder(mixed, num_user_bins)
+    raise ValueError(f"unsupported user_token_policy={user_token_policy!r}")

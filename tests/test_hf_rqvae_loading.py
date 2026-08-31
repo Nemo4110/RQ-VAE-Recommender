@@ -83,3 +83,16 @@ def test_decoder_train_exposes_hub_path() -> None:
     assert "pretrained_rqvae_hf_path" in train_parameters
     assert "seed" in train_parameters
 
+def test_loads_raw_tensor_state_dict_without_unsafe_pickle(tmp_path) -> None:
+    source = build_model()
+    raw_state = tmp_path / "raw_state.pt"
+    torch.save(source.state_dict(), raw_state)
+
+    target = build_model()
+    target.load_pretrained(str(raw_state))
+
+    for source_value, target_value in zip(
+        source.state_dict().values(), target.state_dict().values(), strict=True
+    ):
+        assert torch.equal(source_value, target_value)
+

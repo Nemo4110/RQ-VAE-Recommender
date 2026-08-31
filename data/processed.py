@@ -86,6 +86,16 @@ class ItemData(Dataset):
         )
 
 
+def build_subsample_sequence(
+    history: list[int], future_item: int, *, include_future_item: bool
+) -> list[int]:
+    """Return the selectable train sequence for random prefix-to-next-item sampling."""
+
+    if include_future_item:
+        return [*history, int(future_item)]
+    return list(history)
+
+
 class SeqData(Dataset):
     def __init__(
         self,
@@ -93,6 +103,7 @@ class SeqData(Dataset):
         *args,
         is_train: bool = True,
         subsample: bool = False,
+        include_future_item_in_subsample: bool = True,
         force_process: bool = False,
         dataset: RecDataset = RecDataset.ML_1M,
         **kwargs,
@@ -111,6 +122,7 @@ class SeqData(Dataset):
 
         split = "train" if is_train else "test"
         self.subsample = subsample
+        self.include_future_item_in_subsample = include_future_item_in_subsample
         self.sequence_data = raw_data.data[("user", "rated", "item")]["history"][split]
 
         if not self.subsample:
@@ -135,9 +147,10 @@ class SeqData(Dataset):
         user_ids = self.sequence_data["userId"][idx]
 
         if self.subsample:
-            seq = (
-                self.sequence_data["itemId"][idx]
-                + self.sequence_data["itemId_fut"][idx].tolist()
+            seq = build_subsample_sequence(
+                self.sequence_data["itemId"][idx],
+                int(self.sequence_data["itemId_fut"][idx].item()),
+                include_future_item=self.include_future_item_in_subsample,
             )
             start_idx = random.randint(0, max(0, len(seq) - 3))
             end_idx = random.randint(start_idx + 3, start_idx + self.max_seq_len + 1)

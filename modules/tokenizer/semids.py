@@ -1,3 +1,5 @@
+import random
+
 import torch
 
 from data.processed import ItemData
@@ -19,6 +21,72 @@ from torch.utils.data import SequentialSampler
 BATCH_SIZE = 16
 
 
+def generate_unique_random_semantic_ids(
+    *,
+    item_count: int,
+    width: int,
+    cardinality: int,
+    seed: int,
+) -> Tensor:
+    """Generate deterministic, collision-free random IDs in a fixed token space."""
+
+    if item_count < 0:
+        raise ValueError("item_count must be non-negative")
+    if width <= 0 or cardinality <= 1:
+        raise ValueError("width must be positive and cardinality must exceed one")
+    capacity = cardinality**width
+    if item_count > capacity:
+        raise ValueError(
+            "random semantic-ID space is too small for collision-free item assignment: "
+            f"{item_count} > {capacity}"
+        )
+
+    rng = random.Random(seed)
+    sampled: set[int] = set()
+    flat_ids: list[int] = []
+    while len(flat_ids) < item_count:
+        candidate = rng.randrange(capacity)
+        if candidate not in sampled:
+            sampled.add(candidate)
+            flat_ids.append(candidate)
+
+    ids = torch.empty((item_count, width), dtype=torch.long)
+    for row, value in enumerate(flat_ids):
+        for column in range(width - 1, -1, -1):
+            ids[row, column] = value % cardinality
+            value //= cardinality
+    return ids
+
+
+def generate_lsh_semantic_ids(
+    item_vectors: Tensor,
+    *,
+    width: int,
+    num_hyperplanes: int,
+    seed: int,
+) -> Tensor:
+    """Generate deterministic multi-codeword LSH IDs from frozen item vectors."""
+
+    if item_vectors.ndim != 2:
+        raise ValueError("item_vectors must have shape [item_count, embedding_dim]")
+    if width <= 0 or num_hyperplanes <= 0:
+        raise ValueError("width and num_hyperplanes must be positive")
+    if num_hyperplanes > 62:
+        raise ValueError("num_hyperplanes must be at most 62")
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    vectors = item_vectors.detach().cpu().to(dtype=torch.float32)
+    hyperplanes = torch.randn(
+        (width, num_hyperplanes, vectors.shape[1]), generator=generator
+    )
+    powers = (1 << torch.arange(num_hyperplanes, dtype=torch.long)).unsqueeze(0)
+    codes = []
+    for hyperplanes_for_codeword in hyperplanes:
+        bits = (vectors @ hyperplanes_for_codeword.T > 0).to(dtype=torch.long)
+        codes.append((bits * powers).sum(dim=1))
+    return torch.stack(codes, dim=1)
+
+
 class SemanticIdTokenizer(nn.Module):
     """
     Tokenizes a batch of sequences of item features into a batch of sequences of semantic ids.
@@ -37,6 +105,11 @@ class SemanticIdTokenizer(nn.Module):
         rqvae_hf_model_path: Optional[str] = None,
         rqvae_codebook_normalize: bool = False,
         rqvae_sim_vq: bool = False,
+        semantic_id_source: str = "rqvae",
+        random_id_seed: int = 0,
+        random_id_cardinality: int | None = None,
+        lsh_seed: int = 0,
+        lsh_num_hyperplanes: int = 8,
     ) -> None:
         super().__init__()
 
@@ -87,8 +160,34 @@ class SemanticIdTokenizer(nn.Module):
 
         self.rq_vae.eval()
 
+        if semantic_id_source not in ("rqvae", "random", "lsh"):
+            raise ValueError(
+                "semantic_id_source must be 'rqvae', 'random', or 'lsh'; "
+                f"got {semantic_id_source!r}"
+            )
         self.codebook_size = codebook_size
         self.n_layers = n_layers
+        resolved_random_id_cardinality = (
+            codebook_size if random_id_cardinality is None else int(random_id_cardinality)
+        )
+        if not 1 < resolved_random_id_cardinality <= codebook_size:
+            raise ValueError(
+                "random_id_cardinality must be in [2, codebook_size]; "
+                f"got {resolved_random_id_cardinality} for codebook_size={codebook_size}"
+            )
+        if semantic_id_source == "lsh":
+            if not 0 < lsh_num_hyperplanes <= 62:
+                raise ValueError("lsh_num_hyperplanes must be in [1, 62]")
+            if 2**int(lsh_num_hyperplanes) > codebook_size:
+                raise ValueError(
+                    "lsh_num_hyperplanes produces codes outside codebook_size: "
+                    f"2**{lsh_num_hyperplanes} > {codebook_size}"
+                )
+        self.semantic_id_source = semantic_id_source
+        self.random_id_seed = int(random_id_seed)
+        self.random_id_cardinality = resolved_random_id_cardinality
+        self.lsh_seed = int(lsh_seed)
+        self.lsh_num_hyperplanes = int(lsh_num_hyperplanes)
         self.reset()
 
     def _get_hits(self, query: Tensor, key: Tensor) -> Tensor:
@@ -142,6 +241,23 @@ class SemanticIdTokenizer(nn.Module):
     @torch.no_grad
     @eval_mode
     def precompute_corpus_ids(self, movie_dataset: ItemData) -> Tensor:
+        if self.semantic_id_source == "random":
+            self.cached_ids = generate_unique_random_semantic_ids(
+                item_count=len(movie_dataset),
+                width=self.sem_ids_dim,
+                cardinality=self.random_id_cardinality,
+                seed=self.random_id_seed,
+            ).to(self.rq_vae.device)
+            return self.cached_ids
+        if self.semantic_id_source == "lsh":
+            self.cached_ids = generate_lsh_semantic_ids(
+                movie_dataset.item_data[:, : self.rq_vae.input_dim],
+                width=self.sem_ids_dim,
+                num_hyperplanes=self.lsh_num_hyperplanes,
+                seed=self.lsh_seed,
+            ).to(self.rq_vae.device)
+            return self.cached_ids
+
         cached_ids = None
         dedup_dim = []
         sampler = BatchSampler(
@@ -187,6 +303,11 @@ class SemanticIdTokenizer(nn.Module):
         # If block has to return 3-sized ids for use in precompute_corpus_ids
         # Else block has to return deduped 4-sized ids for use in decoder training.
         if self.cached_ids is None or batch.ids.max() >= self.cached_ids.shape[0]:
+            if self.semantic_id_source in ("random", "lsh"):
+                raise RuntimeError(
+                    f"{self.semantic_id_source} semantic IDs require precompute_corpus_ids "
+                    "before tokenization"
+                )
             B, N = batch.ids.shape
             sem_ids = self.rq_vae.get_semantic_ids(batch.x).sem_ids
             D = sem_ids.shape[-1]

@@ -105,9 +105,15 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
         return next(self.encoder.parameters()).device
 
     def load_pretrained(self, path: str) -> None:
-        state = torch.load(path, map_location=self.device, weights_only=False)
-        self.load_state_dict(state["model"])
-        print(f"---Loaded RQVAE Iter {state['iter']}---")
+        state = torch.load(path, map_location=self.device, weights_only=True)
+        model_state = state["model"] if "model" in state else state
+        if not isinstance(model_state, dict) or not all(
+            isinstance(value, Tensor) for value in model_state.values()
+        ):
+            raise ValueError("RQ-VAE checkpoint must contain a tensor state dict")
+        self.load_state_dict(model_state)
+        source = f"iter {state['iter']}" if "iter" in state else "raw state dict"
+        print(f"---Loaded RQVAE {source}---")
 
     def encode(self, x: Tensor) -> Tensor:
         return self.encoder(x)
