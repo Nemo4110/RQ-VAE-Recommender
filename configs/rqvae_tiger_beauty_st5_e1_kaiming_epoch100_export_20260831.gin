@@ -1,0 +1,9 @@
+include 'configs/rqvae_tiger_beauty_st5_e1_kaiming_epoch10_20260831.gin'
+
+# Extend the passing real-content E1 health gate; export only tensor state for
+# a later source-matched decoder comparison after full health remains passed.
+train_rqvae_healthy.train.arm_name = 'st5_E1_kaiming_reset_warmup_epoch100_export'
+train_rqvae_healthy.train.output_dir = 'out/rqvae/tiger_beauty_st5_E1_kaiming_epoch100_export_20260831'
+train_rqvae_healthy.train.epochs = 100
+train_rqvae_healthy.train.max_optimizer_steps = 1200
+train_rqvae_healthy.train.checkpoint_every_epochs = 0

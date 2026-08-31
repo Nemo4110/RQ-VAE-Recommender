@@ -1,0 +1,25 @@
+import train_rqvae_healthy
+
+# EMA-isolation control: keep Kaiming, warmup, and per-step dead-code reset;
+# disable EMA so codebook movement remains the ordinary AdamW path.
+train_rqvae_healthy.train.arm_name = 'E1_kaiming_reset_warmup_epoch1'
+train_rqvae_healthy.train.output_dir = 'out/rqvae/tiger_beauty_healthy_E1_kaiming_epoch_20260830'
+train_rqvae_healthy.train.dataset_folder = 'dataset/amazon-p5'
+train_rqvae_healthy.train.dataset_split = 'beauty'
+train_rqvae_healthy.train.expected_num_items = 12101
+train_rqvae_healthy.train.seed = 20260830
+train_rqvae_healthy.train.epochs = 1
+train_rqvae_healthy.train.max_optimizer_steps = 12
+train_rqvae_healthy.train.batch_size = 1024
+train_rqvae_healthy.train.learning_rate = 0.001
+train_rqvae_healthy.train.weight_decay = 0.0001
+train_rqvae_healthy.train.warmup_steps = 50
+train_rqvae_healthy.train.use_ema_codebook = False
+train_rqvae_healthy.train.dead_code_reset_every = 1
+train_rqvae_healthy.train.use_kaiming_relu_initialization = True
+train_rqvae_healthy.train.codebook_normalize = False
+train_rqvae_healthy.train.gumbel_temperature = 0.2
+train_rqvae_healthy.train.suffix_capacity = 256
+train_rqvae_healthy.train.minimum_usage = 0.80
+train_rqvae_healthy.train.snapshot_every_steps = 1
+train_rqvae_healthy.train.stop_on_failed_health_gate = True

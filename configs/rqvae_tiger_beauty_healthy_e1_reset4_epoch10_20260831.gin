@@ -1,0 +1,26 @@
+import train_rqvae_healthy
+
+# Healthy-local-improvement lane only.  Cadence 2 is healthy but does not
+# improve the primary H@10 gate; test the next reset-spacing midpoint against
+# the known failing cadence 12 before any further decoder expansion.
+train_rqvae_healthy.train.arm_name = 'E1_kaiming_reset4_warmup_epoch10'
+train_rqvae_healthy.train.output_dir = 'out/rqvae/tiger_beauty_healthy_E1_reset4_epoch10_20260831'
+train_rqvae_healthy.train.dataset_folder = 'dataset/amazon-p5'
+train_rqvae_healthy.train.dataset_split = 'beauty'
+train_rqvae_healthy.train.expected_num_items = 12101
+train_rqvae_healthy.train.seed = 20260830
+train_rqvae_healthy.train.epochs = 10
+train_rqvae_healthy.train.max_optimizer_steps = 120
+train_rqvae_healthy.train.batch_size = 1024
+train_rqvae_healthy.train.learning_rate = 0.001
+train_rqvae_healthy.train.weight_decay = 0.0001
+train_rqvae_healthy.train.warmup_steps = 50
+train_rqvae_healthy.train.use_ema_codebook = False
+train_rqvae_healthy.train.dead_code_reset_every = 4
+train_rqvae_healthy.train.use_kaiming_relu_initialization = True
+train_rqvae_healthy.train.codebook_normalize = False
+train_rqvae_healthy.train.gumbel_temperature = 0.2
+train_rqvae_healthy.train.suffix_capacity = 256
+train_rqvae_healthy.train.minimum_usage = 0.80
+train_rqvae_healthy.train.snapshot_every_steps = 12
+train_rqvae_healthy.train.stop_on_failed_health_gate = True

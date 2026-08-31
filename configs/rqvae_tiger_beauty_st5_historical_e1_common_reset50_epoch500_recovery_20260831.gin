@@ -1,0 +1,10 @@
+include 'configs/rqvae_tiger_beauty_st5_historical_e1_common_reset50_epoch10_20260831.gin'
+
+# The historical reset50 mechanism has a documented early-collapse/recovery
+# trajectory.  Do not stop before reset50; final corpus health is the gate.
+train_rqvae_healthy.train.arm_name = 'st5_historical_E1_common_reset50_epoch500_recovery'
+train_rqvae_healthy.train.output_dir = 'out/rqvae/tiger_beauty_st5_historical_E1_common_reset50_epoch500_recovery_20260831'
+train_rqvae_healthy.train.epochs = 500
+train_rqvae_healthy.train.max_optimizer_steps = 6000
+train_rqvae_healthy.train.snapshot_every_steps = 50
+train_rqvae_healthy.train.stop_on_failed_health_gate = False

@@ -1,0 +1,9 @@
+include 'configs/rqvae_tiger_beauty_healthy_e1_kaiming_epoch100_export_20260830.gin'
+# RQ-VAE semantic-quality diagnostic: retain E1's anti-collapse ingredients but
+# reset dead codewords every 12 optimizer steps rather than after every batch.
+train_rqvae_healthy.train.arm_name = 'E1_kaiming_reset12_warmup_epoch10'
+train_rqvae_healthy.train.output_dir = 'out/rqvae/tiger_beauty_healthy_E1_reset12_epoch10_20260831'
+train_rqvae_healthy.train.epochs = 10
+train_rqvae_healthy.train.max_optimizer_steps = 120
+train_rqvae_healthy.train.dead_code_reset_every = 12
+train_rqvae_healthy.train.snapshot_every_steps = 12
