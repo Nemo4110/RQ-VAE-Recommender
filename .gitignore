@@ -4,3 +4,5 @@ out
 wandb
 trained_models/transformer*
 tl_out
+
+.ipynb_checkpoints/
