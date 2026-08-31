@@ -1,0 +1,7 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Paper-batch diagnostic: change only the decoder batch size to the TeX-stated
+# 256. 2500 updates match the baseline 1k × 640 example budget.
+train.batch_size=256
+train.iterations=2500
+train.save_model_every=1000
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_batch256_2500_20260831/'

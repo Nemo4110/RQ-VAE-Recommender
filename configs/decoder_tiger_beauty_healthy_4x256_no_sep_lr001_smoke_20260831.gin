@@ -1,0 +1,4 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+# Recheck the nearest prior LR alternative after removing separator tokens.
+train.learning_rate=0.001
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_lr001_smoke_20260831/'

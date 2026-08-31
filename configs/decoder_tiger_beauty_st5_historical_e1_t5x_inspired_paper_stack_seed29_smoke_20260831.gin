@@ -1,0 +1,13 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_validation_seed29_smoke_20260831.gin'
+
+# Bounded paper-stack compatibility gate.  The TIGER TeX specifies batch 256,
+# LR .01 held for 10k steps then inverse-sqrt decay, four layers, six 64-d heads
+# and MLP 1024.  The TeX names T5X but not optimizer; fixed-LR Adafactor is an
+# explicit local T5X-inspired approximation, not an exact author claim.
+# Keep d_model=384 to satisfy 6*64 and remain near the stated ~13M scale; the
+# literal 128 wording is separately documented as unresolved.
+train.batch_size=256
+train.learning_rate=0.01
+train.inverse_sqrt_warmup_steps=10000
+train.decoder_optimizer='adafactor_fixed_lr'
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_t5x_inspired_paper_stack_seed29_smoke_20260831/'

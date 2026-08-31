@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_randomid255_no_sep_seed29_smoke_20260831.gin'
+
+# Bounded exact continuation of the 1k Random-ID diagnostic.  Restore model,
+# optimizer and inverse-square-root scheduler state; add exactly 1k updates.
+train.iterations=1000
+train.pretrained_decoder_path='out/decoder/tiger_beauty_randomid255_no_sep_seed29_smoke_20260831/checkpoint_999.pt'
+train.save_model_every=1000
+train.save_dir_root='out/decoder/tiger_beauty_randomid255_no_sep_seed29_resume_to2k_20260831/'

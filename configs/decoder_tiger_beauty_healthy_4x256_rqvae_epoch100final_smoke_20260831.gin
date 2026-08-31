@@ -1,0 +1,5 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Semantic-ID selection diagnostic: same healthy E1 run, but its epoch-100 final
+# raw state rather than the epoch-36 minimum-total-loss state used by all prior decoder arms.
+train.pretrained_rqvae_path='out/rqvae/tiger_beauty_healthy_E1_kaiming_epoch100_export_20260830/model_final_state_dict.pt'
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_rqvae_epoch100final_smoke_20260831/'

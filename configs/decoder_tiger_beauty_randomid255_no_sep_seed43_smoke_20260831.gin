@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_randomid255_no_sep_seed29_smoke_20260831.gin'
+
+# Independent decoder-initialization repeat for the fixed Random-ID K=255 map.
+# This isolates decoder seed variation before testing a second random-ID map.
+train.seed=43
+train.save_dir_root='out/decoder/tiger_beauty_randomid255_no_sep_seed43_smoke_20260831/'

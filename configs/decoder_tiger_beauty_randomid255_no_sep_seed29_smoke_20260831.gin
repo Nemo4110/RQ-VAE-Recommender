@@ -1,0 +1,12 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+
+# TIGER-paper Random-ID control: four independently random codewords sampled
+# from 255 values, matching the paper ablation's K=255 while retaining the
+# decoder's fixed 4x256 output heads (value 255 remains available but unused).
+# It is a diagnostic control, not an RQ-VAE or paper-reproduction replacement.
+train.semantic_id_source='random'
+train.random_id_seed=20260831
+train.random_id_cardinality=255
+train.save_dir_root='out/decoder/tiger_beauty_randomid255_no_sep_seed29_smoke_20260831/'
+# Explicitly preserve the existing local train+validation random-window policy.
+train.train_subsample_include_validation_target=True

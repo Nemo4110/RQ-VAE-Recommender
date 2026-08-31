@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+
+# One downstream gate for the only new healthy RQ-VAE cadence candidate.
+# Keep the selected no-separator seed-29 decoder recipe unchanged; swap only
+# the safely exported reset-every-2 RQ-VAE best-loss tensor state and write
+# fresh artifacts.  The matching post-hoc evaluator must use beam size 100.
+train.pretrained_rqvae_path='out/rqvae/tiger_beauty_healthy_E1_reset2_epoch100_export_20260831/model_best_total_loss_state_dict.pt'
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_reset2_seed29_smoke_20260831/'

@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Literal paper-text architecture diagnostic: Section 4 says input dimension 128.
+# Keep all other selected local settings unchanged; label separately because this
+# conflicts with the same paragraph's 6x64 head product and ~13M parameter count.
+train.t5_d_model=128
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_dmodel128_smoke_20260831/'

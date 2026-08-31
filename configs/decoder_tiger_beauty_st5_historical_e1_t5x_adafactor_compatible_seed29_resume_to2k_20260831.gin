@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_smoke_20260831.gin'
+
+# Bounded convergence check after the CPU-verified T5X-compatible 1k gate.
+# Restore model, optimizer global step/factored moments, and scheduler exactly;
+# add only 1,000 updates, then run beam-100 paper-candidate evaluation.
+train.iterations=1000
+train.pretrained_decoder_path='out/decoder/tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_smoke_20260831/checkpoint_999.pt'
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_resume_to2k_20260831/'

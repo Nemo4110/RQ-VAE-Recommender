@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_smoke_20260831.gin'
+
+# Public T5X T5-1.0 framework-default loss gate.  Preserve the selected
+# per-position T5X-compatible 1k stack and add only z_loss=1e-4.
+train.decoder_z_loss=0.0001
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_t5x_zloss_seed29_smoke_20260831/'

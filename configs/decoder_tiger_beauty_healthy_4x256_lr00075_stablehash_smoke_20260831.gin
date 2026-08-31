@@ -1,0 +1,5 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Hashing-Trick diagnostic: retain the paper-fixed 2,000 token capacity but use
+# a deterministic non-periodic raw-user hash instead of direct raw_id % 2000.
+train.user_token_policy='stable_hashed_bucket'
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_stablehash_smoke_20260831/'

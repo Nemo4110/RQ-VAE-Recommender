@@ -1,0 +1,7 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_sep_seed29_smoke_20260831.gin'
+
+# Literal-text architecture gate on verified real content.  TIGER TeX says
+# “input dimension ... 128” but also says 6 heads x 64 and ~13M params.  Isolate
+# the former reading only; preserve the selected source-matched decoder baseline.
+train.t5_d_model=128
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_dmodel128_no_sep_seed29_smoke_20260831/'

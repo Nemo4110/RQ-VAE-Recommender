@@ -1,0 +1,14 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_sep_seed29_resume_to3k_20260831.gin'
+
+# User-authorized long-horizon diagnostic: continue the exact historical-E1
+# 3k decoder trajectory in one uninterrupted process to total 200k updates.
+# Keep data exposure, semantic IDs, optimizer, scheduler, architecture, seed,
+# and evaluator contract unchanged.  Save only the requested total-step
+# milestones to bound storage usage.
+train.iterations=197000
+train.pretrained_decoder_path='out/decoder/tiger_beauty_st5_historical_e1_no_sep_seed29_resume_to3k_20260831/checkpoint_999.pt'
+train.save_model_every=1000000
+train.save_model_at=[2000, 7000, 17000, 47000, 97000, 197000]
+train.partial_eval_every=1000000
+train.full_eval_every=1000000
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_no_sep_seed29_longrun_to200k_20260831/'

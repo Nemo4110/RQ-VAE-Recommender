@@ -1,0 +1,4 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_smoke_20260830.gin'
+# One-dimensional midpoint diagnostic between LR=0.0005 and the 0.001 candidate peak.
+train.learning_rate=0.00075
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_smoke_20260831/'

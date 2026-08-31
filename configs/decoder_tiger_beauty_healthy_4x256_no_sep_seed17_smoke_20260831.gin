@@ -1,0 +1,4 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+# Third independent seed for the no-separator paper-input confirmation.
+train.seed=17
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_seed17_smoke_20260831/'

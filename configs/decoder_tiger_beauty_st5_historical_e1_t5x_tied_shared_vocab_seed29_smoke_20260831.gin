@@ -1,0 +1,9 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_smoke_20260831.gin'
+
+# Paper/T5X-1.0 architecture gate: the paper specifies ReLU and a vocabulary of
+# semantic-codeword tokens; public T5X T5 1.0 uses logits_via_embedding=True.
+# Preserve all data, split, optimizer, schedule, width, seed, and training budget;
+# replace only four untied position heads with one tied 1024-token item vocabulary.
+train.decoder_head_mode='shared_vocab'
+train.output_embedding_mode='tied'
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_t5x_tied_shared_vocab_seed29_smoke_20260831/'

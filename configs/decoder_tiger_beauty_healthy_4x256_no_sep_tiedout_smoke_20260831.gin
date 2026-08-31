@@ -1,0 +1,5 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+# T5X-style logits-via-embedding diagnostic: tie per-position output weights to
+# the shared semantic token input embedding table.
+train.output_embedding_mode='tied'
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_tiedout_smoke_20260831/'

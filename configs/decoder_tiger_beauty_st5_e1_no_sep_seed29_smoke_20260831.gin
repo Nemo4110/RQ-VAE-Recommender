@@ -1,0 +1,9 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+
+# Corrected Beauty content-semantic decoder gate.  Preserve the selected
+# no-separator paper/full-ID decoder recipe; replace only the feature corpus
+# and the RQ-VAE tensor checkpoint selected by its real-content health gate.
+train.dataset_folder='dataset/amazon-p5-st5'
+train.pretrained_rqvae_path='out/rqvae/tiger_beauty_st5_E1_kaiming_epoch100_export_20260831/model_best_total_loss_state_dict.pt'
+train.save_dir_root='out/decoder/tiger_beauty_st5_e1_no_sep_seed29_smoke_20260831/'
+train.train_subsample_include_validation_target=True

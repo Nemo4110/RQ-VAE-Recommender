@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_sep_seed29_smoke_20260831.gin'
+
+# Paper split-alignment gate: TIGER TeX says penultimate item is validation and
+# the remaining history is training.  Preserve the selected real-content
+# historical-E1 semantic IDs and all decoder settings; exclude validation from
+# randomly sampled decoder-training windows only.
+train.train_subsample_include_validation_target=False
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_no_validation_seed29_smoke_20260831/'

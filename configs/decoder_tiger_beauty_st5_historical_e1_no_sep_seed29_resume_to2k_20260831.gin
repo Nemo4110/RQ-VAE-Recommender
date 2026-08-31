@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_sep_seed29_smoke_20260831.gin'
+
+# Exact 1k→2k continuation of the selected real-content historical-E1 decoder.
+# Restore model, optimizer and scheduler state; add exactly 1,000 updates.
+train.iterations=1000
+train.pretrained_decoder_path='out/decoder/tiger_beauty_st5_historical_e1_no_sep_seed29_smoke_20260831/checkpoint_999.pt'
+train.save_model_every=1000
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_no_sep_seed29_resume_to2k_20260831/'

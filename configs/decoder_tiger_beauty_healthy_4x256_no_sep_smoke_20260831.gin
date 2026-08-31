@@ -1,0 +1,5 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Paper input-sequence diagnostic: TIGER describes user token followed directly
+# by semantic-codeword tokens; remove the fork's learned inter-item separators.
+train.should_add_sep_token=False
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_smoke_20260831/'

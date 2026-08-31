@@ -1,0 +1,9 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Exact-model-start schedule diagnostic: resume the already evaluated seed-29
+# 1k peak, retain optimizer moments, then override only the restored scheduler
+# decay boundary to 1k for the following 1k updates.
+train.iterations=1000
+train.pretrained_decoder_path='out/decoder/tiger_beauty_healthy_4x256_lr00075_smoke_20260831/checkpoint_999.pt'
+train.resume_inverse_sqrt_warmup_steps=1000
+train.save_model_every=1000
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_exact_resume_decay1k_2k_20260831/'

@@ -1,0 +1,11 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+
+# TIGER-paper LSH control: four independent 8-hyperplane codewords from the
+# frozen 768-dimensional Beauty content vectors (four 256-value positions).
+# It changes only the semantic-ID source; this one-seed 1k run is diagnostic.
+train.semantic_id_source='lsh'
+train.lsh_seed=20260831
+train.lsh_num_hyperplanes=8
+train.save_dir_root='out/decoder/tiger_beauty_lsh8_no_sep_seed29_smoke_20260831/'
+# Explicitly preserve the selected local train+validation random-window policy.
+train.train_subsample_include_validation_target=True

@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_randomid255_no_sep_seed29_smoke_20260831.gin'
+
+# One frozen-map sensitivity diagnostic. Keep decoder seed 29 and every recipe
+# setting fixed; change only the deterministic random item→ID mapping seed.
+train.random_id_seed=20260830
+train.save_dir_root='out/decoder/tiger_beauty_randomid255_no_sep_mapseed20260830_seed29_smoke_20260831/'

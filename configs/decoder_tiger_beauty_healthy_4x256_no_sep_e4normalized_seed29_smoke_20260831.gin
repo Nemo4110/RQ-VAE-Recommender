@@ -1,0 +1,8 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_no_sep_smoke_20260831.gin'
+
+# One downstream gate for the E4-inspired normalized-codebook RQ-VAE candidate.
+# Keep the selected seed-29 no-separator decoder recipe unchanged; swap only the
+# audited tensor-only RQ-VAE state and set its required construction flag.
+train.pretrained_rqvae_path='out/rqvae/tiger_beauty_healthy_E4_normalized_reset_epoch100_export_20260831/model_best_total_loss_state_dict.pt'
+train.vae_codebook_normalize=True
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_no_sep_e4normalized_seed29_smoke_20260831/'

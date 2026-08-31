@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# T5X-vocabulary-shape diagnostic: one shared 1024-token output projection,
+# instead of four independent position heads. Candidate generation is fully
+# unmasked over the shared vocabulary; native generation slices legal ranges.
+train.decoder_head_mode='shared_vocab'
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_sharedvocab_smoke_20260831/'

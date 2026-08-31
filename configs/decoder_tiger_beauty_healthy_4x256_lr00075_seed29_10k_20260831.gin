@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+train.iterations=10000
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_seed29_10k_20260831/'
+train.save_model_every=1000
+train.partial_eval_every=5000
+train.full_eval_every=1000

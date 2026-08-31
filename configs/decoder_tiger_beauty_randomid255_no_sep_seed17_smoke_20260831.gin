@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_randomid255_no_sep_seed29_smoke_20260831.gin'
+
+# Final decoder-seed repeat for the fixed Random-ID K=255 map.  This closes the
+# planned three-seed 1k stability check; no continuation is implied.
+train.seed=17
+train.save_dir_root='out/decoder/tiger_beauty_randomid255_no_sep_seed17_smoke_20260831/'

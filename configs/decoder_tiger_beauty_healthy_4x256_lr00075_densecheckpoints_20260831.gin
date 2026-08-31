@@ -1,0 +1,5 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# Checkpoint-selection diagnostic: preserve the selected local recipe but save at
+# 250-step intervals so the candidate evaluator can locate an earlier peak.
+train.save_model_every=250
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_lr00075_densecheckpoints_20260831/'

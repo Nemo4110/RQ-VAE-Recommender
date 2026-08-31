@@ -1,0 +1,6 @@
+include 'configs/decoder_tiger_beauty_healthy_4x256_lr00075_smoke_20260831.gin'
+# T5X loss-semantics diagnostic: standard seq2seq token loss is averaged over
+# output positions. Pair this mean reduction with the paper-stated 0.01 LR.
+train.decoder_loss_reduction='mean'
+train.learning_rate=0.01
+train.save_dir_root='out/decoder/tiger_beauty_healthy_4x256_meanloss_lr01_smoke_20260831/'

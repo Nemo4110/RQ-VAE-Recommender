@@ -1,0 +1,13 @@
+include 'configs/decoder_tiger_beauty_st5_historical_e1_no_validation_seed29_smoke_20260831.gin'
+
+# CPU-verified bounded compatibility gate for the public T5X framework-default
+# Adafactor mathematics.  Preserve historical-E1 semantic IDs, the paper split,
+# batch 256, LR .01, the 10k constant-LR phase, architecture, seed, and evaluator.
+# T5X's public default has no weight decay; the generic train.weight_decay value
+# is set to zero here so the resolved configuration is not misleading.
+train.batch_size=256
+train.learning_rate=0.01
+train.weight_decay=0.0
+train.inverse_sqrt_warmup_steps=10000
+train.decoder_optimizer='t5x_adafactor_compatible'
+train.save_dir_root='out/decoder/tiger_beauty_st5_historical_e1_t5x_adafactor_compatible_seed29_smoke_20260831/'
