@@ -12,9 +12,14 @@ from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from modules.tiger_policy import HISTORICAL_NATIVE
 from modules.tiger_policy import PAPER_FULL_ID
 from modules.tiger_policy import select_semantic_id_tokens
+from modules.tiger_policy import user_bucket_indices
+from modules.tiger_policy import MODULO_HASHED_BUCKET
 from modules.tiger_policy import token_type_offsets
 
 torch.set_float32_matmul_precision("high")
+
+PER_POSITION_HEADS = "per_position_heads"
+SHARED_VOCAB_HEAD = "shared_vocab"
 
 
 class ModelOutput(NamedTuple):
@@ -26,6 +31,16 @@ class ModelOutput(NamedTuple):
 class GenerationOutput(NamedTuple):
     sem_ids: Tensor
     log_probas: Tensor
+
+
+def t5x_z_loss(logits: Tensor, coefficient: float) -> Tensor:
+    """Return the public T5X auxiliary ``coefficient * log(Z)^2`` mean."""
+
+    if coefficient < 0:
+        raise ValueError("z-loss coefficient must be non-negative")
+    if coefficient == 0:
+        return logits.new_zeros(())
+    return coefficient * torch.logsumexp(logits, dim=-1).square().mean()
 
 
 def _select_policy_tokens(
@@ -73,6 +88,11 @@ class EncoderDecoderRetrievalModel(nn.Module):
         top_k_for_generation: int = 10,
         should_add_sep_token: bool = True,
         num_user_bins: Optional[int] = None,
+        user_token_policy: str = MODULO_HASHED_BUCKET,
+        decoder_head_mode: str = PER_POSITION_HEADS,
+        output_embedding_mode: str = "untied",
+        decoder_loss_reduction: str = "sum",
+        decoder_z_loss: float = 0.0,
     ):
         super().__init__()
 
@@ -103,6 +123,24 @@ class EncoderDecoderRetrievalModel(nn.Module):
             raise ValueError("token_cardinalities must match num_hierarchies")
         if any(cardinality <= 0 for cardinality in self.token_cardinalities):
             raise ValueError("token cardinalities must be positive")
+        if decoder_head_mode not in (PER_POSITION_HEADS, SHARED_VOCAB_HEAD):
+            raise ValueError(
+                f"unsupported decoder_head_mode={decoder_head_mode!r}"
+            )
+        self.decoder_head_mode = decoder_head_mode
+        if output_embedding_mode not in ("untied", "tied"):
+            raise ValueError(
+                f"unsupported output_embedding_mode={output_embedding_mode!r}"
+            )
+        self.output_embedding_mode = output_embedding_mode
+        if decoder_loss_reduction not in ("sum", "mean"):
+            raise ValueError(
+                f"unsupported decoder_loss_reduction={decoder_loss_reduction!r}"
+            )
+        self.decoder_loss_reduction = decoder_loss_reduction
+        if decoder_z_loss < 0:
+            raise ValueError("decoder_z_loss must be non-negative")
+        self.decoder_z_loss = decoder_z_loss
         if self.source_sem_ids_dim < num_hierarchies:
             raise ValueError("source_sem_ids_dim cannot be smaller than decoder width")
         self.register_buffer(
@@ -111,6 +149,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
             persistent=False,
         )
         self.top_k_for_generation = top_k_for_generation
+        self.user_token_policy = user_token_policy
         self.register_buffer("codebooks", codebooks)
         if codebooks.ndim != 2 or codebooks.shape[1] != num_hierarchies:
             raise ValueError("codebooks width must match num_hierarchies")
@@ -136,12 +175,22 @@ class EncoderDecoderRetrievalModel(nn.Module):
         )
         self.t5_decoder = T5Stack(decoder_config)
         self.bos_token = nn.Parameter(torch.randn(1, t5_d_model), requires_grad=True)
-        self.decoder_mlp = nn.ModuleList(
-            [
-                nn.Linear(t5_d_model, cardinality, bias=False)
-                for cardinality in self.token_cardinalities
-            ]
-        )
+        if self.output_embedding_mode == "tied":
+            self.decoder_mlp = nn.ModuleList()
+            self.shared_decoder_mlp = None
+        elif self.decoder_head_mode == PER_POSITION_HEADS:
+            self.decoder_mlp = nn.ModuleList(
+                [
+                    nn.Linear(t5_d_model, cardinality, bias=False)
+                    for cardinality in self.token_cardinalities
+                ]
+            )
+            self.shared_decoder_mlp = None
+        else:
+            self.decoder_mlp = nn.ModuleList()
+            self.shared_decoder_mlp = nn.Linear(
+                t5_d_model, sum(self.token_cardinalities), bias=False
+            )
 
         # Shared embedding table uses cumulative offsets for variable token cardinalities.
         self.item_sid_embedding_table = nn.Embedding(
@@ -241,7 +290,11 @@ class EncoderDecoderRetrievalModel(nn.Module):
 
         if user_id is not None and self.user_embedding is not None:
             user_embeds = self.user_embedding(
-                torch.remainder(user_id[:, 0], self.user_embedding.num_embeddings)
+                user_bucket_indices(
+                    user_id[:, 0],
+                    self.user_embedding.num_embeddings,
+                    self.user_token_policy,
+                )
             )
             inputs_embeds = torch.cat([user_embeds.unsqueeze(1), inputs_embeds], dim=1)
             attention_mask = torch.cat(
@@ -258,6 +311,61 @@ class EncoderDecoderRetrievalModel(nn.Module):
         ).last_hidden_state
         return encoder_output, attention_mask
 
+    def decoder_logits(
+        self,
+        hidden_state: torch.Tensor,
+        hierarchy: int,
+        *,
+        full_vocab: bool = False,
+    ) -> torch.Tensor:
+        """Return decoder logits for one semantic-ID position.
+
+        ``shared_vocab`` retains a single 1024-token-style output head.  Native
+        generation slices that head to the position's legal token range, while
+        paper-candidate generation can explicitly request the whole vocabulary.
+        """
+
+        if hierarchy < 0 or hierarchy >= self.num_hierarchies:
+            raise ValueError("hierarchy is out of range")
+        if self.output_embedding_mode == "tied":
+            # Match T5X T5 1.0's logits-via-embedding convention: scale decoder
+            # states before projecting through the input token embedding table.
+            scale = hidden_state.shape[-1] ** -0.5
+            if self.decoder_head_mode == SHARED_VOCAB_HEAD:
+                logits = F.linear(
+                    hidden_state * scale, self.item_sid_embedding_table.weight
+                )
+                if full_vocab:
+                    return logits
+                start = sum(self.token_cardinalities[:hierarchy])
+                end = start + self.token_cardinalities[hierarchy]
+                return logits[:, start:end]
+            if full_vocab:
+                raise ValueError("tied per-position head has no shared full vocabulary")
+            start = sum(self.token_cardinalities[:hierarchy])
+            end = start + self.token_cardinalities[hierarchy]
+            return F.linear(
+                hidden_state * scale, self.item_sid_embedding_table.weight[start:end]
+            )
+        if self.decoder_head_mode == PER_POSITION_HEADS:
+            return self.decoder_mlp[hierarchy](hidden_state)
+        assert self.shared_decoder_mlp is not None
+        logits = self.shared_decoder_mlp(hidden_state)
+        if full_vocab:
+            return logits
+        start = sum(self.token_cardinalities[:hierarchy])
+        end = start + self.token_cardinalities[hierarchy]
+        return logits[:, start:end]
+
+    def decoder_target_ids(
+        self, local_ids: torch.Tensor, hierarchy: int
+    ) -> torch.Tensor:
+        """Map local hierarchy IDs to the configured decoder target vocabulary."""
+
+        if self.decoder_head_mode == PER_POSITION_HEADS:
+            return local_ids
+        return local_ids + sum(self.token_cardinalities[:hierarchy])
+
     def decoder_forward_pass(
         self,
         attention_mask=None,
@@ -266,15 +374,20 @@ class EncoderDecoderRetrievalModel(nn.Module):
         attention_mask_for_encoder=None,
         use_cache=False,
         past_key_values=None,
+        future_ids_are_global: bool = False,
     ):
         if future_ids is not None:
-            shifted = self._add_repeating_offset_to_rows(
-                input_sids=future_ids,
-                codebook_size=self.num_embeddings_per_hierarchy,
-                num_hierarchies=self.num_hierarchies,
-                attention_mask=torch.ones_like(future_ids)
-                if attention_mask is None
-                else attention_mask,
+            shifted = (
+                future_ids
+                if future_ids_are_global
+                else self._add_repeating_offset_to_rows(
+                    input_sids=future_ids,
+                    codebook_size=self.num_embeddings_per_hierarchy,
+                    num_hierarchies=self.num_hierarchies,
+                    attention_mask=torch.ones_like(future_ids)
+                    if attention_mask is None
+                    else attention_mask,
+                )
             )
             inputs_embeds = self.item_sid_embedding_table(shifted)
 
@@ -343,10 +456,18 @@ class EncoderDecoderRetrievalModel(nn.Module):
         total_loss = torch.tensor(0.0, device=decoder_output.device)
         loss_d = []
         for h in range(self.num_hierarchies):
-            logits = self.decoder_mlp[h](decoder_output[:, h])
-            h_loss = F.cross_entropy(logits, fut_ids[:, h].long())
+            logits = self.decoder_logits(
+                decoder_output[:, h],
+                h,
+                full_vocab=self.decoder_head_mode == SHARED_VOCAB_HEAD,
+            )
+            h_loss = F.cross_entropy(
+                logits, self.decoder_target_ids(fut_ids[:, h].long(), h)
+            ) + t5x_z_loss(logits, self.decoder_z_loss)
             total_loss = total_loss + h_loss
             loss_d.append(h_loss.detach())
+        if self.decoder_loss_reduction == "mean":
+            total_loss = total_loss / self.num_hierarchies
 
         return ModelOutput(loss=total_loss, logits=None, loss_d=torch.stack(loss_d))
 
@@ -394,7 +515,7 @@ class EncoderDecoderRetrievalModel(nn.Module):
                 past_key_values=past_kv,
             )
 
-            probas = F.softmax(self.decoder_mlp[h](dec_out[:, -1, :]), dim=-1)
+            probas = F.softmax(self.decoder_logits(dec_out[:, -1, :], h), dim=-1)
             n_cands = min(64, self.token_cardinalities[h])
             samples = torch.multinomial(probas, num_samples=n_cands)
             samp_log_p = torch.log(torch.gather(probas, 1, samples))

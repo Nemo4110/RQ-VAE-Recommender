@@ -13,8 +13,10 @@ from data.utils import cycle
 from data.utils import next_batch
 from evaluate.metrics import TopKAccumulator
 from evaluate.tiger_native import NativeItemTopKAccumulator
+from modules.checkpointing import resolve_checkpoint_steps
 from modules.model import EncoderDecoderRetrievalModel
 from modules.scheduler.inv_sqrt import InverseSquareRootScheduler
+from modules.t5x_adafactor import T5XAdafactor
 from modules.tokenizer.semids import SemanticIdTokenizer
 from modules.tiger_policy import HISTORICAL_NATIVE
 from modules.tiger_policy import DATASET_CAPPED_USER_BINS
@@ -24,12 +26,15 @@ from modules.tiger_policy import select_semantic_id_tokens
 from modules.tiger_policy import token_cardinalities
 from modules.tiger_policy import validate_checkpoint_policy
 from modules.tiger_policy import validate_full_semantic_ids
+from modules.tiger_policy import validate_non_placeholder_tiger_content
+from modules.tiger_policy import validate_semantic_id_source
 from modules.utils import compute_debug_metrics
 from modules.utils import parse_config
 from huggingface_hub import login
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import Adafactor
 
 
 @gin.configurable
@@ -51,6 +56,7 @@ def train(
     mixed_precision_type="fp16",
     gradient_accumulate_every=1,
     save_model_every=1000000,
+    save_model_at=None,
     partial_eval_every=1000,
     full_eval_every=10000,
     vae_input_dim=18,
@@ -64,6 +70,7 @@ def train(
     dataset_split="beauty",
     push_vae_to_hf=False,
     train_data_subsample=True,
+    train_subsample_include_validation_target=True,
     vae_hf_model_name="edobotta/rqvae-amazon-beauty",
     max_grad_norm=None,
     t5_d_model=128,
@@ -79,6 +86,20 @@ def train(
     user_bin_mode="explicit",
     user_bin_cap=2000,
     evaluator_policy="native_semantic_id",
+    full_id_suffix_cardinality=None,
+    decoder_optimizer="adamw",
+    decoder_head_mode="per_position_heads",
+    output_embedding_mode="untied",
+    decoder_loss_reduction="sum",
+    decoder_z_loss=0.0,
+    semantic_id_source="rqvae",
+    random_id_seed=0,
+    random_id_cardinality=None,
+    lsh_seed=0,
+    lsh_num_hyperplanes=8,
+    inverse_sqrt_warmup_steps=10000,
+    resume_learning_rate=None,
+    resume_inverse_sqrt_warmup_steps=None,
     seed=None,
     top_k_eval_list=[1, 5, 10],
 ):
@@ -93,6 +114,17 @@ def train(
         rqvae_n_layers=vae_n_layers,
     )
     policy.validate()
+    checkpoint_steps = resolve_checkpoint_steps(
+        iterations=iterations,
+        save_model_every=save_model_every,
+        save_model_at=save_model_at,
+    )
+    if semantic_id_source not in ("rqvae", "random", "lsh"):
+        raise ValueError("semantic_id_source must be 'rqvae', 'random', or 'lsh'")
+    if semantic_id_source in ("random", "lsh") and tiger_token_policy != "paper/full-id":
+        raise ValueError(
+            "random and lsh semantic IDs require tiger_token_policy='paper/full-id'"
+        )
     if evaluator_policy != NATIVE_SEMANTIC_ID:
         raise ValueError(
             "train_decoder.py implements the native semantic-ID evaluator; "
@@ -125,11 +157,14 @@ def train(
         force_process=force_dataset_process,
         split=dataset_split,
     )
+    if semantic_id_source in ("rqvae", "lsh"):
+        validate_non_placeholder_tiger_content(item_dataset.item_text)
     train_dataset = SeqData(
         root=dataset_folder,
         dataset=dataset,
         is_train=True,
         subsample=train_data_subsample,
+        include_future_item_in_subsample=train_subsample_include_validation_target,
         split=dataset_split,
     )
     dataset_user_count = int(torch.unique(train_dataset.sequence_data["userId"]).numel())
@@ -162,6 +197,11 @@ def train(
         rqvae_hf_model_path=pretrained_rqvae_hf_path,
         rqvae_codebook_normalize=vae_codebook_normalize,
         rqvae_sim_vq=vae_sim_vq,
+        semantic_id_source=semantic_id_source,
+        random_id_seed=random_id_seed,
+        random_id_cardinality=random_id_cardinality,
+        lsh_seed=lsh_seed,
+        lsh_num_hyperplanes=lsh_num_hyperplanes,
     )
     tokenizer = accelerator.prepare(tokenizer)
     tokenizer.precompute_corpus_ids(item_dataset)
@@ -172,7 +212,7 @@ def train(
 
     all_codebooks = tokenizer.cached_ids.cpu()
     if policy.uses_collision_suffix:
-        full_id_summary = validate_full_semantic_ids(all_codebooks)
+        full_id_summary = validate_full_semantic_ids(all_codebooks, semantic_id_source=semantic_id_source)
         if not full_id_summary["full_id_unique"]:
             raise ValueError(
                 "paper/full-id policy requires unique post-training full semantic IDs"
@@ -185,12 +225,22 @@ def train(
         n_layers=vae_n_layers,
         rqvae_codebook_size=vae_codebook_size,
         token_policy=policy.token_policy,
+        full_id_suffix_cardinality=full_id_suffix_cardinality,
     )
     print(
         {
             "seed": seed,
             "tiger_policy": policy.metadata(),
             "token_cardinalities": decoder_cardinalities,
+            "semantic_id_source": semantic_id_source,
+            "random_id_seed": random_id_seed if semantic_id_source == "random" else None,
+            "random_id_cardinality": tokenizer.random_id_cardinality
+            if semantic_id_source == "random"
+            else None,
+            "lsh_seed": tokenizer.lsh_seed if semantic_id_source == "lsh" else None,
+            "lsh_num_hyperplanes": tokenizer.lsh_num_hyperplanes
+            if semantic_id_source == "lsh"
+            else None,
         }
     )
 
@@ -208,14 +258,40 @@ def train(
         top_k_for_generation=top_k_for_generation,
         should_add_sep_token=should_add_sep_token,
         num_user_bins=policy.effective_num_user_bins,
+        user_token_policy=policy.user_token_policy,
+        decoder_head_mode=decoder_head_mode,
+        output_embedding_mode=output_embedding_mode,
+        decoder_loss_reduction=decoder_loss_reduction,
+        decoder_z_loss=decoder_z_loss,
     )
     model = torch.compile(model)
 
-    optimizer = AdamW(
-        params=model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+    if decoder_optimizer == "adamw":
+        optimizer = AdamW(
+            params=model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+    elif decoder_optimizer == "adafactor_fixed_lr":
+        optimizer = Adafactor(
+            model.parameters(),
+            lr=learning_rate,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+            weight_decay=weight_decay,
+        )
+    elif decoder_optimizer == "t5x_adafactor_compatible":
+        optimizer = T5XAdafactor(model.parameters(), lr=learning_rate)
+    else:
+        raise ValueError(
+            "decoder_optimizer must be 'adamw', 'adafactor_fixed_lr', "
+            "or 't5x_adafactor_compatible'"
+        )
 
-    lr_scheduler = InverseSquareRootScheduler(optimizer=optimizer, warmup_steps=10000)
+    if inverse_sqrt_warmup_steps <= 0:
+        raise ValueError("inverse_sqrt_warmup_steps must be positive")
+    lr_scheduler = InverseSquareRootScheduler(
+        optimizer=optimizer, warmup_steps=inverse_sqrt_warmup_steps
+    )
 
     start_iter = 0
     if pretrained_decoder_path is not None:
@@ -223,10 +299,45 @@ def train(
             pretrained_decoder_path, map_location=device, weights_only=False
         )
         validate_checkpoint_policy(checkpoint.get("tiger_policy"), policy)
+        if checkpoint.get("train_subsample_include_validation_target", True) != train_subsample_include_validation_target:
+            raise ValueError(
+                "train_subsample_include_validation_target mismatch between checkpoint and requested run"
+            )
+        validate_semantic_id_source(
+            checkpoint.get("semantic_id_source"),
+            semantic_id_source,
+            checkpoint_random_seed=checkpoint.get("random_id_seed"),
+            requested_random_seed=random_id_seed if semantic_id_source == "random" else None,
+            checkpoint_random_cardinality=checkpoint.get("random_id_cardinality"),
+            requested_random_cardinality=(
+                tokenizer.random_id_cardinality if semantic_id_source == "random" else None
+            ),
+            checkpoint_lsh_seed=checkpoint.get("lsh_seed"),
+            requested_lsh_seed=tokenizer.lsh_seed if semantic_id_source == "lsh" else None,
+            checkpoint_lsh_num_hyperplanes=checkpoint.get("lsh_num_hyperplanes"),
+            requested_lsh_num_hyperplanes=(
+                tokenizer.lsh_num_hyperplanes if semantic_id_source == "lsh" else None
+            ),
+        )
+        checkpoint_optimizer = checkpoint.get("decoder_optimizer")
+        if checkpoint_optimizer is not None and checkpoint_optimizer != decoder_optimizer:
+            raise ValueError(
+                "decoder_optimizer mismatch between checkpoint and requested run: "
+                f"{checkpoint_optimizer!r} != {decoder_optimizer!r}"
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if resume_learning_rate is not None:
+            if resume_learning_rate <= 0:
+                raise ValueError("resume_learning_rate must be positive")
+            for group in optimizer.param_groups:
+                group["lr"] = resume_learning_rate
         if "scheduler" in checkpoint:
             lr_scheduler.load_state_dict(checkpoint["scheduler"])
+        if resume_inverse_sqrt_warmup_steps is not None:
+            if resume_inverse_sqrt_warmup_steps <= 0:
+                raise ValueError("resume_inverse_sqrt_warmup_steps must be positive")
+            lr_scheduler.warmup_steps = resume_inverse_sqrt_warmup_steps
         start_iter = checkpoint["iter"] + 1
 
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
@@ -329,14 +440,31 @@ def train(
                 metrics_accumulator.reset()
 
             if accelerator.is_main_process:
-                if (iter + 1) % save_model_every == 0 or iter + 1 == iterations:
+                if iter + 1 in checkpoint_steps:
+                    scheduler_state = lr_scheduler.state_dict()
                     state = {
                         "iter": iter,
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": lr_scheduler.state_dict(),
+                        "scheduler": scheduler_state,
+                        "cumulative_optimizer_steps": scheduler_state.get("last_epoch"),
                         "tiger_policy": policy.metadata(),
                         "token_cardinalities": decoder_cardinalities,
+                        "decoder_head_mode": decoder_head_mode,
+                        "output_embedding_mode": output_embedding_mode,
+                        "decoder_loss_reduction": decoder_loss_reduction,
+                        "decoder_z_loss": decoder_z_loss,
+                        "decoder_optimizer": decoder_optimizer,
+                        "semantic_id_source": semantic_id_source,
+                        "random_id_seed": random_id_seed if semantic_id_source == "random" else None,
+                        "random_id_cardinality": tokenizer.random_id_cardinality
+                        if semantic_id_source == "random"
+                        else None,
+                        "lsh_seed": tokenizer.lsh_seed if semantic_id_source == "lsh" else None,
+                        "lsh_num_hyperplanes": tokenizer.lsh_num_hyperplanes
+                        if semantic_id_source == "lsh"
+                        else None,
+                        "train_subsample_include_validation_target": train_subsample_include_validation_target,
                         "seed": seed,
                     }
 
